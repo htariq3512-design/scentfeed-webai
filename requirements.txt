@@ -8,3 +8,10 @@ openai>=1.51.0
 
 
 
+fastapi
+uvicorn
+openai
+python-dotenv
+httpx
+firebase-admin
+google-cloud-firestore
