@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
 
-APP_VERSION = "1.6.0-keywords-wide+analyze"
+APP_VERSION = "1.6.1-keywords-wide+analyze"
 
 # --- Optional Firestore (if creds are configured) ---
 FIRESTORE_READY = False
@@ -144,7 +144,7 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
         wishlist = _merge_lists(wishlist, fallback.wishlist)
     return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-# ---- Keyword detection (WIDE). Add more roots here anytime.
+# ---- Keyword detection (WIDE)
 KEYWORD_VARIANTS = {
     "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla", r"madagascar\s*vanilla"],
     "oud":       [r"oud", r"agarwood"],
@@ -197,147 +197,150 @@ def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str
             return False
     return True
 
-# ---- Fallback catalog for MANY roots (expand freely)
+# ---- Fallback catalog (keyword args ONLY)
+def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
+    return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
+
 FALLBACK_CATALOG = {
     "vanilla": [
-        Recommendation("Guerlain Spiritueuse Double Vanille","Rich vanilla with boozy warmth—clearly vanilla-forward.",95,"vanilla, rum, benzoin"),
-        Recommendation("Tom Ford Tobacco Vanille","Dense vanilla wrapped in tobacco and spice—deep vanilla profile.",92,"vanilla, tobacco, tonka"),
-        Recommendation("Kayali Vanilla | 28","Sweet, wearable vanilla with amber warmth—vanilla signature.",90,"vanilla, amber, brown sugar"),
+        R("Guerlain Spiritueuse Double Vanille","Rich vanilla with boozy warmth—clearly vanilla-forward.",95,"vanilla, rum, benzoin"),
+        R("Tom Ford Tobacco Vanille","Dense vanilla wrapped in tobacco and spice—deep vanilla profile.",92,"vanilla, tobacco, tonka"),
+        R("Kayali Vanilla | 28","Sweet, wearable vanilla with amber warmth—vanilla signature.",90,"vanilla, amber, brown sugar"),
     ],
     "oud": [
-        Recommendation("Initio Oud for Greatness","Pronounced oud with saffron—bold, modern oud.",92,"oud, saffron, patchouli"),
-        Recommendation("Acqua di Parma Oud","Smooth oud with citrus lift—refined oud.",90,"oud, bergamot, leather"),
-        Recommendation("Montale Black Aoud","Dark rose-oud signature—classic oud presence.",88,"oud, rose, patchouli"),
+        R("Initio Oud for Greatness","Pronounced oud with saffron—bold, modern oud.",92,"oud, saffron, patchouli"),
+        R("Acqua di Parma Oud","Smooth oud with citrus lift—refined oud.",90,"oud, bergamot, leather"),
+        R("Montale Black Aoud","Dark rose-oud signature—classic oud presence.",88,"oud, rose, patchouli"),
     ],
     "rose": [
-        Recommendation("Frederic Malle Portrait of a Lady","Luxurious rose with patchouli—rose statement.",92,"rose, patchouli, incense"),
-        Recommendation("Diptyque Eau Rose","Airy, naturalistic rose—fresh daily rose.",89,"rose, lychee, musk"),
-        Recommendation("Le Labo Rose 31","Spice-wood rose—modern unisex rose.",88,"rose, cumin, cedar"),
+        R("Frederic Malle Portrait of a Lady","Luxurious rose with patchouli—rose statement.",92,"rose, patchouli, incense"),
+        R("Diptyque Eau Rose","Airy, naturalistic rose—fresh daily rose.",89,"rose, lychee, musk"),
+        R("Le Labo Rose 31","Spice-wood rose—modern unisex rose.",88,"rose, cumin, cedar"),
     ],
     "amber": [
-        Recommendation("Hermès Ambre Narguilé","Honeyed tobacco-amber—cozy amber aura.",91,"amber, honey, tobacco"),
-        Recommendation("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
-        Recommendation("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
+        R("Hermès Ambre Narguilé","Honeyed tobacco-amber—cozy amber aura.",91,"amber, honey, tobacco"),
+        R("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
+        R("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
     ],
     "citrus": [
-        Recommendation("Acqua di Parma Colonia","Classic bright citrus—timeless.",89,"citrus, lemon, neroli"),
-        Recommendation("Dior Homme Cologne (2013)","Brisk citrus with clean musk—ultra-fresh.",90,"citrus, bergamot, musk"),
-        Recommendation("Chanel Allure Homme Sport Cologne","Sparkling citrus—sporty freshness.",88,"citrus, mandarin, aldehydes"),
+        R("Acqua di Parma Colonia","Classic bright citrus—timeless.",89,"citrus, lemon, neroli"),
+        R("Dior Homme Cologne (2013)","Brisk citrus with clean musk—ultra-fresh.",90,"citrus, bergamot, musk"),
+        R("Chanel Allure Homme Sport Cologne","Sparkling citrus—sporty freshness.",88,"citrus, mandarin, aldehydes"),
     ],
     "lavender": [
-        Recommendation("Mugler A*Men Pure Havane","Aromatic lavender twist with sweetness—soothing lavender facet.",86,"lavender, honey, tobacco"),
-        Recommendation("YSL Libre","Modern lavender with florals—elegant lavender lift.",88,"lavender, orange blossom, vanilla"),
-        Recommendation("Guerlain Jicky","Classic aromatic lavender—heritage vibe.",85,"lavender, citrus, vanilla"),
+        R("YSL Libre","Modern lavender with florals—elegant lavender lift.",88,"lavender, orange blossom, vanilla"),
+        R("Guerlain Jicky","Classic aromatic lavender—heritage vibe.",85,"lavender, citrus, vanilla"),
+        R("Tom Ford Beau de Jour","Barbershop lavender—crisp and clean.",87,"lavender, oakmoss, patchouli"),
     ],
     "leather": [
-        Recommendation("Tom Ford Ombre Leather","Supple leather—smoky, slightly sweet leather core.",90,"leather, cardamom, jasmine"),
-        Recommendation("Acqua di Parma Leather","Refined leather with citrus brightness.",88,"leather, citrus, rose"),
-        Recommendation("Floris Leather Oud","Dark leather with oud depth.",87,"leather, oud, rose"),
+        R("Tom Ford Ombre Leather","Supple leather—smoky, slightly sweet leather core.",90,"leather, cardamom, jasmine"),
+        R("Acqua di Parma Leather","Refined leather with citrus brightness.",88,"leather, citrus, rose"),
+        R("Floris Leather Oud","Dark leather with oud depth.",87,"leather, oud, rose"),
     ],
     "iris": [
-        Recommendation("Dior Homme Intense","Makeup-y iris—soft, elegant iris heart.",90,"iris, cocoa, amber"),
-        Recommendation("Prada Infusion d'Iris","Airy, clean iris—effortless and elegant.",88,"iris, neroli, cedar"),
-        Recommendation("Guerlain L'Homme Ideal Cologne","Fresh almond-iris vibe—casual iris tone.",85,"iris, almond, citrus"),
+        R("Dior Homme Intense","Makeup-y iris—soft, elegant iris heart.",90,"iris, cocoa, amber"),
+        R("Prada Infusion d'Iris","Airy, clean iris—effortless and elegant.",88,"iris, neroli, cedar"),
+        R("Chanel No.19 Poudré","Powdery iris—polished and chic.",87,"iris, powder, musk"),
     ],
     "vetiver": [
-        Recommendation("Guerlain Vetiver","Crisp, classic vetiver—green and woody.",90,"vetiver, citrus, tobacco"),
-        Recommendation("Tom Ford Grey Vetiver","Clean, modern vetiver—office friendly.",89,"vetiver, citrus, woods"),
-        Recommendation("Encre Noire","Inky, dark vetiver—mysterious vetiver depth.",88,"vetiver, cypress, woods"),
+        R("Guerlain Vetiver","Crisp, classic vetiver—green and woody.",90,"vetiver, citrus, tobacco"),
+        R("Tom Ford Grey Vetiver","Clean, modern vetiver—office friendly.",89,"vetiver, citrus, woods"),
+        R("Encre Noire","Inky, dark vetiver—mysterious vetiver depth.",88,"vetiver, cypress, woods"),
     ],
     "sandalwood": [
-        Recommendation("Le Labo Santal 33","Dry, smoky sandalwood—iconic.",90,"sandalwood, cedar, leather"),
-        Recommendation("Diptyque Tam Dao","Creamy sandalwood—meditative.",89,"sandalwood, cedar, cypress"),
-        Recommendation("Mysore Sandal Soap vibe (metaphor)","Classic creamy sandalwood impression.",85,"sandalwood"),
+        R("Le Labo Santal 33","Dry, smoky sandalwood—iconic.",90,"sandalwood, cedar, leather"),
+        R("Diptyque Tam Dao","Creamy sandalwood—meditative.",89,"sandalwood, cedar, cypress"),
+        R("Mysore Sandal Vibe","Classic creamy sandalwood impression.",85,"sandalwood"),
     ],
     "jasmine": [
-        Recommendation("Dior J'Adore","Radiant jasmine—polished floral.",90,"jasmine, ylang, rose"),
-        Recommendation("Alaïa Eau de Parfum","Airy jasmine—textured skin-scent.",87,"jasmine, pink pepper, musk"),
-        Recommendation("Byredo Flowerhead","Lush jasmine—celebratory floral.",88,"jasmine, tuberose, green notes"),
+        R("Dior J'Adore","Radiant jasmine—polished floral.",90,"jasmine, ylang, rose"),
+        R("Byredo Flowerhead","Lush jasmine—celebratory floral.",88,"jasmine, tuberose, green notes"),
+        R("Alaïa Eau de Parfum","Airy jasmine—textured skin-scent.",87,"jasmine, pink pepper, musk"),
     ],
     "patchouli": [
-        Recommendation("Mugler Angel","Gourmand patchouli—iconic.",90,"patchouli, chocolate, caramel"),
-        Recommendation("Chanel Coco Mademoiselle","Fresh-chypre patchouli—polished.",89,"patchouli, rose, citrus"),
-        Recommendation("Reminiscence Patchouli","Earthy patchouli—bohemian classic.",88,"patchouli, woods, amber"),
+        R("Mugler Angel","Gourmand patchouli—iconic.",90,"patchouli, chocolate, caramel"),
+        R("Chanel Coco Mademoiselle","Fresh-chypre patchouli—polished.",89,"patchouli, rose, citrus"),
+        R("Reminiscence Patchouli","Earthy patchouli—bohemian classic.",88,"patchouli, woods, amber"),
     ],
     "musk": [
-        Recommendation("Narciso Rodriguez For Her EDP","Clean musky floral—signature musk.",90,"musk, rose, peach"),
-        Recommendation("MFK Gentle Fluidity Silver","Transparent musks—airy and modern.",88,"musk, juniper, woods"),
-        Recommendation("Kiehl's Original Musk","Warm vintage musk—cosy aura.",86,"musk, floral accord"),
+        R("Narciso Rodriguez For Her EDP","Clean musky floral—signature musk.",90,"musk, rose, peach"),
+        R("MFK Gentle Fluidity Silver","Transparent musks—airy and modern.",88,"musk, juniper, woods"),
+        R("Kiehl's Original Musk","Warm vintage musk—cosy aura.",86,"musk, floral accord"),
     ],
     "woody": [
-        Recommendation("Terre d'Hermès","Mineral woody—citrus-cedar signature.",90,"woods, cedar, vetiver"),
-        Recommendation("Chanel Bleu de Chanel","Versatile woody-aromatic—anytime.",89,"woods, incense, citrus"),
-        Recommendation("Byredo Super Cedar","Linear cedarwood—clean pencil-shavings vibe.",87,"cedar, musk"),
+        R("Terre d'Hermès","Mineral woody—citrus-cedar signature.",90,"woods, cedar, vetiver"),
+        R("Chanel Bleu de Chanel","Versatile woody-aromatic—anytime.",89,"woods, incense, citrus"),
+        R("Byredo Super Cedar","Linear cedarwood—clean pencil-shavings vibe.",87,"cedar, musk"),
     ],
     "aquatic": [
-        Recommendation("Giorgio Armani Acqua di Giò","Benchmark aquatic—marine freshness.",90,"aquatic, citrus, jasmine"),
-        Recommendation("Issey Miyake L'Eau d'Issey","Watery floral—ozonic clarity.",88,"aquatic, lotus, yuzu"),
-        Recommendation("Bvlgari Aqva Pour Homme","Distinct marine—mineral twist.",86,"aquatic, seaweed, woods"),
+        R("Giorgio Armani Acqua di Giò","Benchmark aquatic—marine freshness.",90,"aquatic, citrus, jasmine"),
+        R("Issey Miyake L'Eau d'Issey","Watery floral—ozonic clarity.",88,"aquatic, lotus, yuzu"),
+        R("Bvlgari Aqva Pour Homme","Distinct marine—mineral twist.",86,"aquatic, seaweed, woods"),
     ],
     "green": [
-        Recommendation("Chanel No.19","Sharp green elegance—crisp galbanum.",90,"green, galbanum, iris"),
-        Recommendation("Diptyque Philosykos","Fig-leaf green—milky-woody fig.",89,"green, fig leaf, coconut"),
-        Recommendation("Tom Ford Vert d'Encens","Green incense—resinous and deep.",87,"green, incense, pine"),
+        R("Chanel No.19","Sharp green elegance—crisp galbanum.",90,"green, galbanum, iris"),
+        R("Diptyque Philosykos","Fig-leaf green—milky-woody fig.",89,"green, fig leaf, coconut"),
+        R("Tom Ford Vert d'Encens","Green incense—resinous and deep.",87,"green, incense, pine"),
     ],
     "spicy": [
-        Recommendation("YSL Opium (modern)","Warm spicy oriental—opulent spice cloud.",90,"spice, vanilla, amber"),
-        Recommendation("Hermès Eau des Merveilles","Sparkling resin-spice—salty amberwood.",88,"spice, amber, woods"),
-        Recommendation("Viktor&Rolf Spicebomb","Explosive warm spices—bold.",88,"spice, pepper, tobacco"),
+        R("Viktor&Rolf Spicebomb","Explosive warm spices—bold.",88,"spice, pepper, tobacco"),
+        R("YSL Opium (modern)","Warm spicy oriental—opulent spice cloud.",90,"spice, vanilla, amber"),
+        R("Hermès Eau des Merveilles","Sparkling resin-spice—salty amberwood.",88,"spice, amber, woods"),
     ],
     "gourmand": [
-        Recommendation("Montale Chocolate Greedy","Dessert-like—cocoa and vanilla.",88,"chocolate, vanilla, tonka"),
-        Recommendation("Prada Candy","Caramel-forward—playful gourmand.",87,"caramel, benzoin, musk"),
-        Recommendation("MFK Baccarat Rouge 540","Sweet-ambery aura—contemporary crowd-pleaser.",89,"ambery sugar, cedar"),
+        R("Montale Chocolate Greedy","Dessert-like—cocoa and vanilla.",88,"chocolate, vanilla, tonka"),
+        R("Prada Candy","Caramel-forward—playful gourmand.",87,"caramel, benzoin, musk"),
+        R("MFK Baccarat Rouge 540","Sweet-ambery aura—contemporary crowd-pleaser.",89,"ambery sugar, cedar"),
     ],
     "coconut": [
-        Recommendation("Guerlain Terracotta Le Parfum","Sun-kissed coconut—holiday vibe.",88,"coconut, tiaré, vanilla"),
-        Recommendation("Tom Ford Soleil Blanc","Creamy coconut-solar—lux beachy.",90,"coconut, amber, ylang"),
-        Recommendation("Comptoir Sud Pacifique Vanille Coco","Coconut-vanilla treat.",85,"coconut, vanilla, heliotrope"),
+        R("Guerlain Terracotta Le Parfum","Sun-kissed coconut—holiday vibe.",88,"coconut, tiaré, vanilla"),
+        R("Tom Ford Soleil Blanc","Creamy coconut-solar—lux beachy.",90,"coconut, amber, ylang"),
+        R("Comptoir Sud Pacifique Vanille Coco","Coconut-vanilla treat.",85,"coconut, vanilla, heliotrope"),
     ],
     "almond": [
-        Recommendation("Dior Hypnotic Poison","Almond-vanilla—deeply cozy.",90,"almond, vanilla, jasmine"),
-        Recommendation("Guerlain L'Homme Ideal EDT","Fresh almond—masculine twist.",87,"almond, citrus, woods"),
-        Recommendation("Profumum Roma Confetto","Sugary almond—comforting.",86,"almond, vanilla, musk"),
+        R("Dior Hypnotic Poison","Almond-vanilla—deeply cozy.",90,"almond, vanilla, jasmine"),
+        R("Guerlain L'Homme Ideal EDT","Fresh almond—masculine twist.",87,"almond, citrus, woods"),
+        R("Profumum Roma Confetto","Sugary almond—comforting.",86,"almond, vanilla, musk"),
     ],
     "cherry": [
-        Recommendation("Tom Ford Lost Cherry","Liqueur cherry—dark and plush.",90,"cherry, almond, tonka"),
-        Recommendation("BDK Rouge Smoking","Cherry-smoke—playful and chic.",88,"cherry accord, vanilla, musk"),
-        Recommendation("Lubic Cherry (metaphor)","Bright cherry impression.",84,"cherry"),
+        R("Tom Ford Lost Cherry","Liqueur cherry—dark and plush.",90,"cherry, almond, tonka"),
+        R("BDK Rouge Smoking","Cherry-smoke—playful and chic.",88,"cherry accord, vanilla, musk"),
+        R("Bright Cherry Vibe","Bright cherry impression.",84,"cherry"),
     ],
     "apple": [
-        Recommendation("D&G Light Blue","Crisp apple-citrus—Mediterranean fresh.",88,"apple, citrus, cedar"),
-        Recommendation("Nina by Nina Ricci","Candied apple—girly fun.",86,"apple, praline, lemon"),
-        Recommendation("Hugo Boss Bottled","Apple-spice—signature masculine.",88,"apple, cinnamon, woods"),
+        R("D&G Light Blue","Crisp apple-citrus—Mediterranean fresh.",88,"apple, citrus, cedar"),
+        R("Nina by Nina Ricci","Candied apple—girly fun.",86,"apple, praline, lemon"),
+        R("Hugo Boss Bottled","Apple-spice—signature masculine.",88,"apple, cinnamon, woods"),
     ],
     "peach": [
-        Recommendation("Guerlain Mitsouko","Iconic peach-chypre—mossy elegance.",90,"peach, oakmoss, spices"),
-        Recommendation("Tom Ford Bitter Peach","Juicy peach—sweet and sultry.",88,"peach, rum, patchouli"),
-        Recommendation("Byredo Peche de Velours (metaphor)","Velvety peach vibe.",84,"peach"),
+        R("Guerlain Mitsouko","Iconic peach-chypre—mossy elegance.",90,"peach, oakmoss, spices"),
+        R("Tom Ford Bitter Peach","Juicy peach—sweet and sultry.",88,"peach, rum, patchouli"),
+        R("Velvety Peach Vibe","Velvety peach vibe.",84,"peach"),
     ],
     "pear": [
-        Recommendation("Jo Malone English Pear & Freesia","Juicy pear—transparent floral.",88,"pear, freesia, musk"),
-        Recommendation("Givenchy L'Interdit EDT","Fresh pear twist—modern floral.",86,"pear, tuberose, orange blossom"),
-        Recommendation("Juliette Has A Gun Pear Inc.","Musky pear—minimalist fresh.",85,"pear, musk, ambroxan"),
+        R("Jo Malone English Pear & Freesia","Juicy pear—transparent floral.",88,"pear, freesia, musk"),
+        R("Givenchy L'Interdit EDT","Fresh pear twist—modern floral.",86,"pear, tuberose, orange blossom"),
+        R("Juliette Has A Gun Pear Inc.","Musky pear—minimalist fresh.",85,"pear, musk, ambroxan"),
     ],
     "tobacco": [
-        Recommendation("Herod by Parfums de Marly","Sweet pipe tobacco—rich and cozy.",90,"tobacco, vanilla, cinnamon"),
-        Recommendation("Molinard Tobacco","Dry tobacco—classic style.",86,"tobacco, woods, spices"),
-        Recommendation("By Kilian Back to Black","Honeyed tobacco—lux comfort.",89,"tobacco, honey, cherry"),
+        R("Parfums de Marly Herod","Sweet pipe tobacco—rich and cozy.",90,"tobacco, vanilla, cinnamon"),
+        R("Molinard Tobacco","Dry tobacco—classic style.",86,"tobacco, woods, spices"),
+        R("By Kilian Back to Black","Honeyed tobacco—lux comfort.",89,"tobacco, honey, cherry"),
     ],
     "incense": [
-        Recommendation("Comme des Garçons Avignon","Cathedral incense—solemn and pure.",90,"incense, woods"),
-        Recommendation("Amouage Interlude Man","Incense-resin storm—powerhouse.",88,"incense, amber, oregano"),
-        Recommendation("Heeley Cardinal","Clean incense—airy church vibe.",87,"incense, aldehydes, woods"),
+        R("Comme des Garçons Avignon","Cathedral incense—solemn and pure.",90,"incense, woods"),
+        R("Amouage Interlude Man","Incense-resin storm—powerhouse.",88,"incense, amber, oregano"),
+        R("Heeley Cardinal","Clean incense—airy church vibe.",87,"incense, aldehydes, woods"),
     ],
     "cedar": [
-        Recommendation("DS & Durga Radio Bombay","Creamy cedar—warm and radiant.",88,"cedar, sandalwood, musk"),
-        Recommendation("Byredo Super Cedar","Linear pencil-cedar—clean modern.",87,"cedar, musk"),
-        Recommendation("Terre d'Hermès Eau Intense Vetiver","Cedar-vetiver mineral twist.",86,"cedar, vetiver, citrus"),
+        R("DS & Durga Radio Bombay","Creamy cedar—warm and radiant.",88,"cedar, sandalwood, musk"),
+        R("Byredo Super Cedar","Linear pencil-cedar—clean modern.",87,"cedar, musk"),
+        R("Terre d'Hermès Eau Intense Vetiver","Cedar-vetiver mineral twist.",86,"cedar, vetiver, citrus"),
     ],
     "pine": [
-        Recommendation("Tom Ford Vert d'Encens","Green pine-incense—resinous depth.",87,"pine, incense, green"),
-        Recommendation("L'Occitane Eau des Baux (metaphor)","Warm pine nuance.",84,"pine, cypress"),
-        Recommendation("Guerlain Winter Delice (metaphor)","Festive pine whisper.",83,"pine, spice"),
+        R("Tom Ford Vert d'Encens","Green pine-incense—resinous depth.",87,"pine, incense, green"),
+        R("Warm Pine Vibe","Warm pine nuance.",84,"pine, cypress"),
+        R("Festive Pine Vibe","Festive pine whisper.",83,"pine, spice"),
     ],
 }
 
@@ -347,8 +350,7 @@ def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[L
     roots = [r for r, _ in groups]
     catalogs = [FALLBACK_CATALOG.get(r, []) for r in roots]
     if any(len(c) == 0 for c in catalogs):
-        return None  # missing catalogs for some root(s)
-
+        return None
     picks: List[Recommendation] = []
     i = 0
     while len(picks) < n:
@@ -359,12 +361,7 @@ def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[L
         for r in roots:
             if r not in reason.lower():
                 reason += f" Clearly {r}-forward elements present."
-        picks.append(Recommendation(
-            name=base.name,
-            reason=reason,
-            match_score=base.match_score,
-            notes=base.notes
-        ))
+        picks.append(Recommendation(name=base.name, reason=reason, match_score=base.match_score, notes=base.notes))
         i += 1
     return picks[:n]
 
@@ -472,7 +469,7 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
         except Exception:
             time.sleep(0.25)
 
-    # Deterministic multi-root fallback (covers ANY supported note(s))
+    # Deterministic multi-root fallback
     if groups:
         fb = _fallback_for(groups, max_results)
         if fb:
@@ -480,7 +477,7 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
 
     raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
 
-# ---- ANALYZE: tool + system prompt ----
+# ---- ANALYZE (for later UI)
 TOOL_SCHEMA_ANALYZE = [
     {
         "type": "function",
@@ -490,7 +487,7 @@ TOOL_SCHEMA_ANALYZE = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "summary": {"type": "string", "description": "2–4 sentence friendly explanation."},
+                    "summary": {"type": "string"},
                     "dominant_notes": {"type": "array", "items": {"type": "string"}},
                     "style_tags": {"type": "array", "items": {"type": "string"}},
                     "occasions": {"type": "array", "items": {"type": "string"}}
@@ -505,7 +502,7 @@ ANALYZE_SYSTEM_PROMPT = """You are ScentFeed's taste analyst.
 - Read likes, dislikes, owned, wishlist.
 - Infer a concise taste profile (notes and styles).
 - Avoid repeating the raw lists; interpret them.
-- Be specific (e.g., "vanilla-forward gourmands") and helpful.
+- Be specific and helpful.
 - Return results via the propose_profile tool.
 """
 
@@ -519,9 +516,7 @@ Wishlist: {', '.join(prefs.wishlist) or '—'}
 Rules:
 - Provide 2–4 sentence summary.
 - Suggest concise dominant_notes (<= {max_tags}), style_tags (<= {max_tags}), occasions (<= {max_tags}).
-- Prefer widely understood words (e.g., "warm", "fresh", "vanilla", "citrus", "office", "date night").
 """
-
     last_err: Optional[Exception] = None
     for _ in range(2):
         try:
@@ -538,22 +533,12 @@ Rules:
             choice = resp.choices[0]
             if not choice.message.tool_calls:
                 raise RuntimeError("Model did not call the analysis tool.")
-
             args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-            summary = str(args.get("summary","")).strip()
+            summary = str(args.get("summary","")).strip() or "We analyzed your recent activity to identify your core scent preferences."
             dominant_notes = [str(x).strip() for x in args.get("dominant_notes", [])][:max_tags]
             style_tags = [str(x).strip() for x in args.get("style_tags", [])][:max_tags]
             occasions = [str(x).strip() for x in args.get("occasions", [])][:max_tags]
-
-            if not summary:
-                summary = "We analyzed your recent activity to identify your core scent preferences."
-
-            return AnalyzeResponse(
-                summary=summary,
-                dominant_notes=dominant_notes,
-                style_tags=style_tags,
-                occasions=occasions
-            )
+            return AnalyzeResponse(summary=summary, dominant_notes=dominant_notes, style_tags=style_tags, occasions=occasions)
         except Exception as e:
             last_err = e
             time.sleep(0.5)
