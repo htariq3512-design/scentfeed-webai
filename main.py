@@ -5,38 +5,73 @@ from typing import List, Optional, Tuple, Pattern
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# --- DB pool for Supabase (REQUIRED for /recommend IDs) ---
-from psycopg_pool import ConnectionPool
+# Load .env first so all env vars are available
+load_dotenv(override=True)
 
-# --- OpenAI (optional; used by /recommend_ai and /analyze) ---
+APP_VERSION = "1.6.2-optional-pg+analyze"
+
+# -------------------------------------------------------------------
+# Optional Firestore (if creds are configured)
+# -------------------------------------------------------------------
+FIRESTORE_READY = False
+db = None
 try:
-    from openai import OpenAI
-    OPENAI_IMPORT_OK = True
+    from firebase_admin import credentials, initialize_app
+    from google.cloud import firestore
+    FIRESTORE_IMPORT_OK = True
 except Exception:
-    OPENAI_IMPORT_OK = False
+    FIRESTORE_IMPORT_OK = False
 
-APP_VERSION = "2.0.0-backend-ids+ai-optional"
+# Try to bring Firestore online (non-fatal if missing)
+if FIRESTORE_IMPORT_OK:
+    try:
+        svc_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+        if svc_json:
+            cred = credentials.Certificate(json.loads(svc_json))
+            initialize_app(cred)
+            db = firestore.Client()
+            FIRESTORE_READY = True
+        elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            initialize_app()
+            db = firestore.Client()
+            FIRESTORE_READY = True
+    except Exception as e:
+        logging.warning("Firestore init skipped: %s", e)
 
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")  # <-- set this in Render (Supabase URI)
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env var is required for /recommend (IDs).")
+# -------------------------------------------------------------------
+# Optional Postgres (only if DATABASE_URL provided)
+# -------------------------------------------------------------------
+POOL = None
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    try:
+        from psycopg_pool import ConnectionPool  # optional dependency
+        POOL = ConnectionPool(
+            conninfo=DATABASE_URL,
+            max_size=5,
+            kwargs={"connect_timeout": 5},
+        )
+        logging.info("Postgres pool enabled.")
+    except Exception as e:
+        logging.warning("Postgres pool disabled: %s", e)
+else:
+    logging.info("DATABASE_URL not set; Postgres disabled.")
 
-# Optional OpenAI (do not hard fail if missing)
+# -------------------------------------------------------------------
+# OpenAI client
+# -------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-AI_READY = bool(OPENAI_IMPORT_OK and OPENAI_API_KEY)
-oai = OpenAI(api_key=OPENAI_API_KEY) if AI_READY else None
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is missing.")
+oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# Create a pooled connection to Supabase Postgres
-pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"sslmode": "require"})
-
-# ------------------------------------------------------------------------------
-# FastAPI app + CORS
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# FastAPI app & CORS
+# -------------------------------------------------------------------
 app = FastAPI(title="ScentFeed Web AI", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -46,34 +81,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------------
-# Shared models
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Pydantic models
+# -------------------------------------------------------------------
 class PreferencePayload(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
     owned: List[str] = Field(default_factory=list)
     wishlist: List[str] = Field(default_factory=list)
 
-# ----- /recommend (IDs) request/response (for iOS app contract) -----
-class RecommendIdsRequest(BaseModel):
-    # matches the iOS RecommendClient payload
-    query: str = ""
-    topN: int = 20
-    userId: Optional[str] = None
-    filters: Optional[dict] = None
-    prefs: Optional[dict] = None
-    persona: Optional[dict] = None
-
-class RankedId(BaseModel):
-    id: str
-    score: Optional[float] = None
-
-class RecommendIdsResponse(BaseModel):
-    items: List[RankedId]
-
-# ----- OpenAI-driven models (kept for your AI flows) -----
-class RecommendAIRequest(BaseModel):
+class RecommendRequest(BaseModel):
     uid: Optional[str] = None
     goal: str = Field(default="Suggest 3 fragrances.")
     max_results: int = Field(default=3, ge=1, le=5)
@@ -85,7 +102,7 @@ class Recommendation(BaseModel):
     match_score: int = Field(ge=0, le=100)
     notes: Optional[str] = None
 
-class RecommendAIResponse(BaseModel):
+class RecommendResponse(BaseModel):
     items: List[Recommendation]
     used_profile: PreferencePayload
 
@@ -100,49 +117,69 @@ class AnalyzeResponse(BaseModel):
     style_tags: List[str] = Field(default_factory=list)
     occasions: List[str] = Field(default_factory=list)
 
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Health
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
 @app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "status": "healthy",
-        "version": APP_VERSION,
-        "ai_ready": AI_READY,
-        "model": OPENAI_MODEL if AI_READY else None,
-    }
+async def health():
+    return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
 
-# ------------------------------------------------------------------------------
-# /recommend  → DB-backed: returns IDs + scores from Supabase RPC
-# ------------------------------------------------------------------------------
-@app.post("/recommend", response_model=RecommendIdsResponse)
-def recommend_ids(req: RecommendIdsRequest):
-    q = req.query or ""
-    limit = max(1, min(100, int(req.topN or 20)))
+# -------------------------------------------------------------------
+# Firestore helpers
+# -------------------------------------------------------------------
+def _merge_lists(a: Optional[List[str]], b: Optional[List[str]]) -> List[str]:
+    out, seen = [], set()
+    for lst in (a or []), (b or []):
+        for x in lst:
+            k = x.strip().lower()
+            if k and k not in seen:
+                seen.add(k); out.append(x.strip())
+    return out
 
-    # Call your RPC: public.search_perfumes(q text, ..., limit_n int)
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select id, score
-                from public.search_perfumes(%s::text, null, null, null, null, null, %s::int)
-                """,
-                (q, limit),
-            )
-            rows = cur.fetchall()
+def _collect_ids(uid: str, sub: str) -> List[str]:
+    if not (FIRESTORE_READY and db and uid):
+        return []
+    try:
+        docs = db.collection("users").document(uid).collection(sub).stream()
+        return [d.id for d in docs]
+    except Exception as e:
+        logging.warning("Firestore subcollection read failed (%s): %s", sub, e)
+        return []
 
-    items = [{"id": r[0], "score": float(r[1]) if r[1] is not None else None} for r in rows]
-    return {"items": items}
+def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -> PreferencePayload:
+    likes, dislikes, owned, wishlist = [], [], [], []
+    if FIRESTORE_READY and db and uid:
+        try:
+            doc = db.collection("users").document(uid).get()
+            if doc.exists:
+                d = doc.to_dict() or {}
+                likes = _merge_lists(likes, d.get("likes", []))
+                dislikes = _merge_lists(dislikes, d.get("dislikes", []))
+                owned = _merge_lists(owned, d.get("owned", []))
+                wishlist = _merge_lists(wishlist, d.get("wishlist", []))
+            pref_doc = db.collection("users").document(uid).collection("preferences").document("default").get()
+            if pref_doc.exists:
+                d2 = pref_doc.to_dict() or {}
+                likes = _merge_lists(likes, d2.get("likes", []))
+                dislikes = _merge_lists(dislikes, d2.get("dislikes", []))
+                owned = _merge_lists(owned, d2.get("owned", []))
+                wishlist = _merge_lists(wishlist, d2.get("wishlist", []))
+            likes = _merge_lists(likes, _collect_ids(uid, "likes"))
+            dislikes = _merge_lists(dislikes, _collect_ids(uid, "dislikes"))
+            owned = _merge_lists(owned, _collect_ids(uid, "owned"))
+            wishlist = _merge_lists(wishlist, _collect_ids(uid, "wishlist"))
+        except Exception as e:
+            logging.warning("Firestore read failed: %s", e)
+    if fallback:
+        likes = _merge_lists(likes, fallback.likes)
+        dislikes = _merge_lists(dislikes, fallback.dislikes)
+        owned = _merge_lists(owned, fallback.owned)
+        wishlist = _merge_lists(wishlist, fallback.wishlist)
+    return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-# ------------------------------------------------------------------------------
-# Everything below this point is your existing OpenAI-driven logic,
-# kept intact but moved under /recommend_ai and /analyze
-# (OpenAI is optional; we return 503 if not configured).
-# ------------------------------------------------------------------------------
-
-# ---- Keyword detection (wide) for AI prompt control ----
+# -------------------------------------------------------------------
+# Keyword detection (WIDE coverage for natural language goals)
+# -------------------------------------------------------------------
 KEYWORD_VARIANTS = {
     "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla", r"madagascar\s*vanilla"],
     "oud":       [r"oud", r"agarwood"],
@@ -186,28 +223,69 @@ def _required_groups_from_goal(goal: str) -> List[Tuple[str, List[Pattern]]]:
 def _item_matches_group(text: str, pats: List[Pattern]) -> bool:
     return any(p.search(text) for p in pats)
 
-def _items_meet_requirements(items: List["Recommendation"], groups: List[Tuple[str, List[Pattern]]]) -> bool:
+def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str, List[Pattern]]]) -> bool:
     if not groups:
         return True
     for it in items:
-        blob = " ".join([getattr(it, "name", "") or "", getattr(it, "reason", "") or "", getattr(it, "notes", "") or ""])
+        blob = " ".join([it.name or "", it.reason or "", it.notes or ""])
         if not all(_item_matches_group(blob, pats) for _, pats in groups):
             return False
     return True
 
-def R(name: str, reason: str, score: int, notes: str) -> "Recommendation":
+# -------------------------------------------------------------------
+# Fallback catalog (deterministic)
+# -------------------------------------------------------------------
+def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
     return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
 
 FALLBACK_CATALOG = {
-    # ... (keep your fallback catalog exactly as you had it)
     "vanilla": [
         R("Guerlain Spiritueuse Double Vanille","Rich vanilla with boozy warmth—clearly vanilla-forward.",95,"vanilla, rum, benzoin"),
         R("Tom Ford Tobacco Vanille","Dense vanilla wrapped in tobacco and spice—deep vanilla profile.",92,"vanilla, tobacco, tonka"),
         R("Kayali Vanilla | 28","Sweet, wearable vanilla with amber warmth—vanilla signature.",90,"vanilla, amber, brown sugar"),
     ],
-    # (snipped for brevity; include the rest from your file unchanged)
+    "oud": [
+        R("Initio Oud for Greatness","Pronounced oud with saffron—bold, modern oud.",92,"oud, saffron, patchouli"),
+        R("Acqua di Parma Oud","Smooth oud with citrus lift—refined oud.",90,"oud, bergamot, leather"),
+        R("Montale Black Aoud","Dark rose-oud signature—classic oud presence.",88,"oud, rose, patchouli"),
+    ],
+    "rose": [
+        R("Frederic Malle Portrait of a Lady","Luxurious rose with patchouli—rose statement.",92,"rose, patchouli, incense"),
+        R("Diptyque Eau Rose","Airy, naturalistic rose—fresh daily rose.",89,"rose, lychee, musk"),
+        R("Le Labo Rose 31","Spice-wood rose—modern unisex rose.",88,"rose, cumin, cedar"),
+    ],
+    "amber": [
+        R("Hermès Ambre Narguilé","Honeyed tobacco-amber—cozy amber aura.",91,"amber, honey, tobacco"),
+        R("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
+        R("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
+    ],
+    # ... (other groups unchanged for brevity)
 }
 
+def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[List[Recommendation]]:
+    if not groups:
+        return None
+    roots = [r for r, _ in groups]
+    catalogs = [FALLBACK_CATALOG.get(r, []) for r in roots]
+    if any(len(c) == 0 for c in catalogs):
+        return None
+    picks: List[Recommendation] = []
+    i = 0
+    while len(picks) < n:
+        cat = catalogs[i % len(catalogs)]
+        idx = (len(picks) // len(catalogs)) % len(cat)
+        base = cat[idx]
+        reason = base.reason
+        for r in roots:
+            if r not in reason.lower():
+                reason += f" Clearly {r}-forward elements present."
+        picks.append(Recommendation(name=base.name, reason=reason, match_score=base.match_score, notes=base.notes))
+        i += 1
+    return picks[:n]
+
+# -------------------------------------------------------------------
+# LLM tool schema (recommend)
+# -------------------------------------------------------------------
 TOOL_SCHEMA_RECOMMEND = [
     {
         "type": "function",
@@ -267,9 +345,10 @@ Rules:
 - 3 results, each reason must clearly include all required note words (exact words or common variants).
 """.strip()
 
-async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendAIResponse:
-    if not AI_READY:
-        raise HTTPException(status_code=503, detail="OpenAI not configured.")
+# -------------------------------------------------------------------
+# OpenAI call with enforcement + multi-root fallback
+# -------------------------------------------------------------------
+async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
     groups = _required_groups_from_goal(goal)
 
     def _msgs(extra: str = ""):
@@ -308,38 +387,21 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
                 for it in raw_items
             ]
             if items and _items_meet_requirements(items, groups):
-                return RecommendAIResponse(items=items, used_profile=prefs)
+                return RecommendResponse(items=items, used_profile=prefs)
         except Exception:
             time.sleep(0.25)
 
-    # simple deterministic fallback if keywords present
+    # Deterministic multi-root fallback
     if groups:
-        roots = [r for r, _ in groups]
-        cats = [FALLBACK_CATALOG.get(r, []) for r in roots]
-        if all(cats):
-            picks: List[Recommendation] = []
-            i = 0
-            while len(picks) < max_results:
-                cat = cats[i % len(cats)]
-                base = cat[(len(picks) // len(cats)) % len(cat)]
-                reason = base.reason
-                for r in roots:
-                    if r not in reason.lower():
-                        reason += f" Clearly {r}-forward elements present."
-                picks.append(Recommendation(name=base.name, reason=reason, match_score=base.match_score, notes=base.notes))
-                i += 1
-            return RecommendAIResponse(items=picks[:max_results], used_profile=prefs)
+        fb = _fallback_for(groups, max_results)
+        if fb:
+            return RecommendResponse(items=fb, used_profile=prefs)
 
-    raise HTTPException(status_code=422, detail="AI recommend failed and no fallback available.")
+    raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
 
-ANALYZE_SYSTEM_PROMPT = """You are ScentFeed's taste analyst.
-- Read likes, dislikes, owned, wishlist.
-- Infer a concise taste profile (notes and styles).
-- Avoid repeating the raw lists; interpret them.
-- Be specific and helpful.
-- Return results via the propose_profile tool.
-"""
-
+# -------------------------------------------------------------------
+# ANALYZE (for taste profile surfacing)
+# -------------------------------------------------------------------
 TOOL_SCHEMA_ANALYZE = [
     {
         "type": "function",
@@ -360,9 +422,15 @@ TOOL_SCHEMA_ANALYZE = [
     }
 ]
 
+ANALYZE_SYSTEM_PROMPT = """You are ScentFeed's taste analyst.
+- Read likes, dislikes, owned, wishlist.
+- Infer a concise taste profile (notes and styles).
+- Avoid repeating the raw lists; interpret them.
+- Be specific and helpful.
+- Return results via the propose_profile tool.
+"""
+
 async def call_openai_analyze(prefs: PreferencePayload, max_tags: int) -> AnalyzeResponse:
-    if not AI_READY:
-        raise HTTPException(status_code=503, detail="OpenAI not configured.")
     user_msg = f"""
 Likes: {', '.join(prefs.likes) or '—'}
 Dislikes: {', '.join(prefs.dislikes) or '—'}
@@ -374,44 +442,44 @@ Rules:
 - Suggest concise dominant_notes (<= {max_tags}), style_tags (<= {max_tags}), occasions (<= {max_tags}).
 """
     last_err: Optional[Exception] = None
-    try:
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.4,
-            messages=[
-                {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg}
-            ],
-            tools=TOOL_SCHEMA_ANALYZE,
-            tool_choice={"type": "function", "function": {"name": "propose_profile"}}
-        )
-        choice = resp.choices[0]
-        if not choice.message.tool_calls:
-            raise RuntimeError("Model did not call the analysis tool.")
-        args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-        summary = str(args.get("summary","")).strip() or "We analyzed your recent activity to identify your core scent preferences."
-        dominant_notes = [str(x).strip() for x in args.get("dominant_notes", [])][:max_tags]
-        style_tags = [str(x).strip() for x in args.get("style_tags", [])][:max_tags]
-        occasions = [str(x).strip() for x in args.get("occasions", [])][:max_tags]
-        return AnalyzeResponse(summary=summary, dominant_notes=dominant_notes, style_tags=style_tags, occasions=occasions)
-    except Exception as e:
-        last_err = e
+    for _ in range(2):
+        try:
+            resp = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ],
+                tools=TOOL_SCHEMA_ANALYZE,
+                tool_choice={"type": "function", "function": {"name": "propose_profile"}}
+            )
+            choice = resp.choices[0]
+            if not choice.message.tool_calls:
+                raise RuntimeError("Model did not call the analysis tool.")
+            args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
+            summary = str(args.get("summary","")).strip() or "We analyzed your recent activity to identify your core scent preferences."
+            dominant_notes = [str(x).strip() for x in args.get("dominant_notes", [])][:max_tags]
+            style_tags = [str(x).strip() for x in args.get("style_tags", [])][:max_tags]
+            occasions = [str(x).strip() for x in args.get("occasions", [])][:max_tags]
+            return AnalyzeResponse(summary=summary, dominant_notes=dominant_notes, style_tags=style_tags, occasions=occasions)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
     raise HTTPException(status_code=503, detail=f"AI analyze failed: {last_err}")
 
-# ----------------------- Public AI endpoints -----------------------
-@app.post("/recommend_ai", response_model=RecommendAIResponse)
-async def recommend_ai(req: RecommendAIRequest):
-    if not AI_READY:
-        raise HTTPException(status_code=503, detail="OpenAI not configured.")
-    prefs = req.prefs or PreferencePayload()
-    return await call_openai_with_tools(req.goal, prefs, req.max_results)
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
+@app.post("/recommend", response_model=RecommendResponse)
+async def recommend(req: RecommendRequest):
+    profile = load_user_prefs(req.uid, req.prefs)
+    return await call_openai_with_tools(req.goal, profile, req.max_results)
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    if not AI_READY:
-        raise HTTPException(status_code=503, detail="OpenAI not configured.")
-    prefs = req.prefs or PreferencePayload()
-    return await call_openai_analyze(prefs, req.max_tags)
+    profile = load_user_prefs(req.uid, req.prefs)
+    return await call_openai_analyze(profile, req.max_tags)
 
 
 
