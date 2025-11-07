@@ -6,7 +6,7 @@ uvicorn[standard]==0.30.6
 openai==1.47.0
 
 # --- Database Connectivity (Supabase / Postgres) ---
-psycopg[binary]==3.2.1
+psycopg[binary]==3.2.12
 psycopg_pool==3.2.2
 
 # --- Firebase & Firestore (optional) ---
