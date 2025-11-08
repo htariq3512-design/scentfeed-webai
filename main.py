@@ -7,11 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
+import httpx  # for Supabase REST
 
 # Load .env first so all env vars are available
 load_dotenv(override=True)
 
-APP_VERSION = "1.6.2-optional-pg+analyze"
+APP_VERSION = "1.6.3-supabase-test+analyze"
 
 # -------------------------------------------------------------------
 # Optional Firestore (if creds are configured)
@@ -42,23 +43,42 @@ if FIRESTORE_IMPORT_OK:
         logging.warning("Firestore init skipped: %s", e)
 
 # -------------------------------------------------------------------
-# Optional Postgres (only if DATABASE_URL provided)
+# Supabase (REST) — REQUIRED for /sb-test, optional for prod
 # -------------------------------------------------------------------
-POOL = None
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if DATABASE_URL:
-    try:
-        from psycopg_pool import ConnectionPool  # optional dependency
-        POOL = ConnectionPool(
-            conninfo=DATABASE_URL,
-            max_size=5,
-            kwargs={"connect_timeout": 5},
-        )
-        logging.info("Postgres pool enabled.")
-    except Exception as e:
-        logging.warning("Postgres pool disabled: %s", e)
-else:
-    logging.info("DATABASE_URL not set; Postgres disabled.")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+if not (SUPABASE_URL and SUPABASE_ANON_KEY):
+    logging.warning("Supabase variables not set; DB-backed features will be disabled.")
+
+async def sb_search_perfumes(q: str, limit_n: int = 10):
+    """
+    Calls your SQL function public.search_perfumes via PostgREST RPC.
+    Expects you've created it in Supabase.
+    Returns a list of rows (dicts) or [].
+    """
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY):
+        return []
+
+    url = f"{SUPABASE_URL}/rest/v1/rpc/search_perfumes"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+    payload = {"q": q, "limit_n": limit_n}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            logging.warning("Supabase RPC search_perfumes failed: %s %s", r.status_code, r.text[:300])
+            return []
+        try:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logging.warning("Supabase RPC JSON parse failed: %s", e)
+            return []
 
 # -------------------------------------------------------------------
 # OpenAI client
@@ -123,6 +143,16 @@ class AnalyzeResponse(BaseModel):
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
+
+# Quick Supabase smoke test
+@app.get("/sb-test")
+async def sb_test(q: str = "vanilla", limit: int = 5):
+    rows = await sb_search_perfumes(q=q, limit_n=limit)
+    out = [
+        {"id": r.get("id"), "name": r.get("name"), "brand": r.get("brand"), "score": r.get("score")}
+        for r in rows
+    ]
+    return {"count": len(out), "items": out}
 
 # -------------------------------------------------------------------
 # Firestore helpers
@@ -259,7 +289,7 @@ FALLBACK_CATALOG = {
         R("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
         R("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
     ],
-    # ... (other groups unchanged for brevity)
+    # ... (extend other groups as needed)
 }
 
 def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[List[Recommendation]]:
