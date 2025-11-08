@@ -1,22 +1,23 @@
 # main.py
 import os, json, time, logging, re
-from typing import List, Optional, Tuple, Pattern
+from typing import List, Optional, Tuple, Pattern, Dict, Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
-import httpx  # for Supabase REST
 
-# Load .env first so all env vars are available
+# ──────────────────────────────────────────────────────────────────────────────
+# Load environment
+# ──────────────────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
+APP_VERSION = "1.7.0-sb-enrich+analyze"
 
-APP_VERSION = "1.6.3-supabase-test+analyze"
-
-# -------------------------------------------------------------------
-# Optional Firestore (if creds are configured)
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional Firestore (non-fatal if not configured)
+# ──────────────────────────────────────────────────────────────────────────────
 FIRESTORE_READY = False
 db = None
 try:
@@ -26,7 +27,6 @@ try:
 except Exception:
     FIRESTORE_IMPORT_OK = False
 
-# Try to bring Firestore online (non-fatal if missing)
 if FIRESTORE_IMPORT_OK:
     try:
         svc_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
@@ -42,56 +42,45 @@ if FIRESTORE_IMPORT_OK:
     except Exception as e:
         logging.warning("Firestore init skipped: %s", e)
 
-# -------------------------------------------------------------------
-# Supabase (REST) — REQUIRED for /sb-test, optional for prod
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional Postgres pool (only if DATABASE_URL provided). Not required for Supabase REST.
+# ──────────────────────────────────────────────────────────────────────────────
+POOL = None
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    try:
+        from psycopg_pool import ConnectionPool  # optional dependency
+        POOL = ConnectionPool(
+            conninfo=DATABASE_URL,
+            max_size=5,
+            kwargs={"connect_timeout": 5},
+        )
+        logging.info("Postgres pool enabled.")
+    except Exception as e:
+        logging.warning("Postgres pool disabled: %s", e)
+else:
+    logging.info("DATABASE_URL not set; Postgres disabled (OK for Supabase REST).")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Supabase (PostgREST) config — used to enrich IDs with name/brand
+# ──────────────────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-if not (SUPABASE_URL and SUPABASE_ANON_KEY):
-    logging.warning("Supabase variables not set; DB-backed features will be disabled.")
+if SUPABASE_URL and not SUPABASE_ANON_KEY:
+    logging.warning("SUPABASE_URL is set but SUPABASE_ANON_KEY is missing.")
 
-async def sb_search_perfumes(q: str, limit_n: int = 10):
-    """
-    Calls your SQL function public.search_perfumes via PostgREST RPC.
-    Expects you've created it in Supabase.
-    Returns a list of rows (dicts) or [].
-    """
-    if not (SUPABASE_URL and SUPABASE_ANON_KEY):
-        return []
-
-    url = f"{SUPABASE_URL}/rest/v1/rpc/search_perfumes"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-    }
-    payload = {"q": q, "limit_n": limit_n}
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code != 200:
-            logging.warning("Supabase RPC search_perfumes failed: %s %s", r.status_code, r.text[:300])
-            return []
-        try:
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            logging.warning("Supabase RPC JSON parse failed: %s", e)
-            return []
-
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # OpenAI client
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing.")
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app & CORS
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="ScentFeed Web AI", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -101,9 +90,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------------
-# Pydantic models
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Models
+# ──────────────────────────────────────────────────────────────────────────────
 class PreferencePayload(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
@@ -137,26 +126,16 @@ class AnalyzeResponse(BaseModel):
     style_tags: List[str] = Field(default_factory=list)
     occasions: List[str] = Field(default_factory=list)
 
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Health
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
 
-# Quick Supabase smoke test
-@app.get("/sb-test")
-async def sb_test(q: str = "vanilla", limit: int = 5):
-    rows = await sb_search_perfumes(q=q, limit_n=limit)
-    out = [
-        {"id": r.get("id"), "name": r.get("name"), "brand": r.get("brand"), "score": r.get("score")}
-        for r in rows
-    ]
-    return {"count": len(out), "items": out}
-
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Firestore helpers
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def _merge_lists(a: Optional[List[str]], b: Optional[List[str]]) -> List[str]:
     out, seen = [], set()
     for lst in (a or []), (b or []):
@@ -207,9 +186,109 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
         wishlist = _merge_lists(wishlist, fallback.wishlist)
     return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Supabase helpers (REST RPC + enrichment)
+# ──────────────────────────────────────────────────────────────────────────────
+async def sb_search_perfumes(q: str, limit_n: int = 10) -> List[Dict[str, Any]]:
+    """
+    Calls your SQL function public.search_perfumes via Supabase REST RPC.
+    Expected return: [{ id: <uuid>, score: <float> }, ...]
+    """
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY):
+        return []
+
+    url = f"{SUPABASE_URL}/rest/v1/rpc/search_perfumes"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Accept-Profile": "public",
+    }
+    payload = {"q": q, "limit_n": limit_n}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            logging.warning("Supabase RPC search_perfumes failed: %s %s", r.status_code, r.text[:300])
+            return []
+        try:
+            rows = r.json()
+            # Normalize keys
+            out = []
+            for row in rows:
+                out.append({
+                    "id": str(row.get("id") or row.get("perfume_id") or ""),
+                    "score": row.get("score"),
+                })
+            return [r for r in out if r["id"]]
+        except Exception as e:
+            logging.warning("Supabase RPC JSON parse failed: %s", e)
+            return []
+
+async def sb_fetch_perfume_details(ids: List[str]) -> dict:
+    """
+    Fetch name/brand for a list of perfume IDs from the perfumes table.
+    Returns a dict: {id: {"name": ..., "brand": ...}}
+    """
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY) or not ids:
+        return {}
+
+    # PostgREST IN filter needs: id=in.("id1","id2",...)
+    quoted = ",".join([f'"{i}"' for i in ids])
+
+    url = f"{SUPABASE_URL}/rest/v1/perfumes"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Accept-Profile": "public",
+    }
+    params = {
+        "select": "id,name,brand",
+        "id": f"in.({quoted})"
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code != 200:
+            logging.warning("Supabase SELECT perfumes failed: %s %s", r.status_code, r.text[:300])
+            return {}
+        try:
+            rows = r.json()
+            return {
+                str(row.get("id")): {
+                    "name": row.get("name"),
+                    "brand": row.get("brand"),
+                }
+                for row in rows
+            }
+        except Exception as e:
+            logging.warning("Supabase SELECT JSON parse failed: %s", e)
+            return {}
+
+@app.get("/sb-test")
+async def sb_test(q: str = "vanilla", limit: int = 5):
+    """
+    Debug endpoint: fetch ranked IDs via RPC and enrich with name/brand.
+    """
+    rows = await sb_search_perfumes(q=q, limit_n=limit)
+    ids = [str(r.get("id")) for r in rows if r.get("id")]
+    detail_map = await sb_fetch_perfume_details(ids)
+
+    items = []
+    for r in rows:
+        rid = str(r.get("id"))
+        d = detail_map.get(rid, {})
+        items.append({
+            "id": rid,
+            "name": d.get("name"),
+            "brand": d.get("brand"),
+            "score": r.get("score"),
+        })
+    return {"count": len(items), "items": items}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Keyword detection (WIDE coverage for natural language goals)
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 KEYWORD_VARIANTS = {
     "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla", r"madagascar\s*vanilla"],
     "oud":       [r"oud", r"agarwood"],
@@ -262,9 +341,9 @@ def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str
             return False
     return True
 
-# -------------------------------------------------------------------
-# Fallback catalog (deterministic)
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Fallback catalog (deterministic; trimmed for brevity)
+# ──────────────────────────────────────────────────────────────────────────────
 def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
     return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
 
@@ -289,7 +368,6 @@ FALLBACK_CATALOG = {
         R("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
         R("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
     ],
-    # ... (extend other groups as needed)
 }
 
 def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[List[Recommendation]]:
@@ -313,9 +391,9 @@ def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[L
         i += 1
     return picks[:n]
 
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # LLM tool schema (recommend)
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 TOOL_SCHEMA_RECOMMEND = [
     {
         "type": "function",
@@ -375,9 +453,9 @@ Rules:
 - 3 results, each reason must clearly include all required note words (exact words or common variants).
 """.strip()
 
-# -------------------------------------------------------------------
-# OpenAI call with enforcement + multi-root fallback
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI calls (recommend / analyze) with fallback
+# ──────────────────────────────────────────────────────────────────────────────
 async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
     groups = _required_groups_from_goal(goal)
 
@@ -429,9 +507,6 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
 
     raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
 
-# -------------------------------------------------------------------
-# ANALYZE (for taste profile surfacing)
-# -------------------------------------------------------------------
 TOOL_SCHEMA_ANALYZE = [
     {
         "type": "function",
@@ -498,9 +573,9 @@ Rules:
             time.sleep(0.5)
     raise HTTPException(status_code=503, detail=f"AI analyze failed: {last_err}")
 
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest):
     profile = load_user_prefs(req.uid, req.prefs)
