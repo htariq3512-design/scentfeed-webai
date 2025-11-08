@@ -1,23 +1,22 @@
 # main.py
 import os, json, time, logging, re
-from typing import List, Optional, Tuple, Pattern, Dict, Any
+from typing import List, Optional, Tuple, Pattern
+from dataclasses import dataclass
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Load environment
-# ──────────────────────────────────────────────────────────────────────────────
+# Load env first
 load_dotenv(override=True)
-APP_VERSION = "1.7.0-sb-enrich+analyze"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional Firestore (non-fatal if not configured)
-# ──────────────────────────────────────────────────────────────────────────────
+APP_VERSION = "1.8.0-soft-constraints+analyze"
+
+# -------------------------------------------------------------------
+# Optional Firestore (non-fatal if missing / not configured)
+# -------------------------------------------------------------------
 FIRESTORE_READY = False
 db = None
 try:
@@ -42,9 +41,9 @@ if FIRESTORE_IMPORT_OK:
     except Exception as e:
         logging.warning("Firestore init skipped: %s", e)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional Postgres pool (only if DATABASE_URL provided). Not required for Supabase REST.
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Optional Postgres via psycopg_pool (non-fatal)
+# -------------------------------------------------------------------
 POOL = None
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL:
@@ -59,28 +58,20 @@ if DATABASE_URL:
     except Exception as e:
         logging.warning("Postgres pool disabled: %s", e)
 else:
-    logging.info("DATABASE_URL not set; Postgres disabled (OK for Supabase REST).")
+    logging.info("DATABASE_URL not set; Postgres disabled.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Supabase (PostgREST) config — used to enrich IDs with name/brand
-# ──────────────────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-if SUPABASE_URL and not SUPABASE_ANON_KEY:
-    logging.warning("SUPABASE_URL is set but SUPABASE_ANON_KEY is missing.")
-
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 # OpenAI client
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing.")
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 # FastAPI app & CORS
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 app = FastAPI(title="ScentFeed Web AI", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -90,9 +81,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Models
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Pydantic models
+# -------------------------------------------------------------------
 class PreferencePayload(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
@@ -126,16 +117,16 @@ class AnalyzeResponse(BaseModel):
     style_tags: List[str] = Field(default_factory=list)
     occasions: List[str] = Field(default_factory=list)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 # Health
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 # Firestore helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 def _merge_lists(a: Optional[List[str]], b: Optional[List[str]]) -> List[str]:
     out, seen = [], set()
     for lst in (a or []), (b or []):
@@ -186,109 +177,9 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
         wishlist = _merge_lists(wishlist, fallback.wishlist)
     return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Supabase helpers (REST RPC + enrichment)
-# ──────────────────────────────────────────────────────────────────────────────
-async def sb_search_perfumes(q: str, limit_n: int = 10) -> List[Dict[str, Any]]:
-    """
-    Calls your SQL function public.search_perfumes via Supabase REST RPC.
-    Expected return: [{ id: <uuid>, score: <float> }, ...]
-    """
-    if not (SUPABASE_URL and SUPABASE_ANON_KEY):
-        return []
-
-    url = f"{SUPABASE_URL}/rest/v1/rpc/search_perfumes"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json",
-        "Accept-Profile": "public",
-    }
-    payload = {"q": q, "limit_n": limit_n}
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code != 200:
-            logging.warning("Supabase RPC search_perfumes failed: %s %s", r.status_code, r.text[:300])
-            return []
-        try:
-            rows = r.json()
-            # Normalize keys
-            out = []
-            for row in rows:
-                out.append({
-                    "id": str(row.get("id") or row.get("perfume_id") or ""),
-                    "score": row.get("score"),
-                })
-            return [r for r in out if r["id"]]
-        except Exception as e:
-            logging.warning("Supabase RPC JSON parse failed: %s", e)
-            return []
-
-async def sb_fetch_perfume_details(ids: List[str]) -> dict:
-    """
-    Fetch name/brand for a list of perfume IDs from the perfumes table.
-    Returns a dict: {id: {"name": ..., "brand": ...}}
-    """
-    if not (SUPABASE_URL and SUPABASE_ANON_KEY) or not ids:
-        return {}
-
-    # PostgREST IN filter needs: id=in.("id1","id2",...)
-    quoted = ",".join([f'"{i}"' for i in ids])
-
-    url = f"{SUPABASE_URL}/rest/v1/perfumes"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Accept-Profile": "public",
-    }
-    params = {
-        "select": "id,name,brand",
-        "id": f"in.({quoted})"
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            logging.warning("Supabase SELECT perfumes failed: %s %s", r.status_code, r.text[:300])
-            return {}
-        try:
-            rows = r.json()
-            return {
-                str(row.get("id")): {
-                    "name": row.get("name"),
-                    "brand": row.get("brand"),
-                }
-                for row in rows
-            }
-        except Exception as e:
-            logging.warning("Supabase SELECT JSON parse failed: %s", e)
-            return {}
-
-@app.get("/sb-test")
-async def sb_test(q: str = "vanilla", limit: int = 5):
-    """
-    Debug endpoint: fetch ranked IDs via RPC and enrich with name/brand.
-    """
-    rows = await sb_search_perfumes(q=q, limit_n=limit)
-    ids = [str(r.get("id")) for r in rows if r.get("id")]
-    detail_map = await sb_fetch_perfume_details(ids)
-
-    items = []
-    for r in rows:
-        rid = str(r.get("id"))
-        d = detail_map.get(rid, {})
-        items.append({
-            "id": rid,
-            "name": d.get("name"),
-            "brand": d.get("brand"),
-            "score": r.get("score"),
-        })
-    return {"count": len(items), "items": items}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Keyword detection (WIDE coverage for natural language goals)
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Keyword detection (wide coverage for natural language goals)
+# -------------------------------------------------------------------
 KEYWORD_VARIANTS = {
     "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla", r"madagascar\s*vanilla"],
     "oud":       [r"oud", r"agarwood"],
@@ -332,7 +223,7 @@ def _required_groups_from_goal(goal: str) -> List[Tuple[str, List[Pattern]]]:
 def _item_matches_group(text: str, pats: List[Pattern]) -> bool:
     return any(p.search(text) for p in pats)
 
-def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str, List[Pattern]]]) -> bool:
+def _items_meet_requirements(items: List["Recommendation"], groups: List[Tuple[str, List[Pattern]]]) -> bool:
     if not groups:
         return True
     for it in items:
@@ -341,9 +232,9 @@ def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str
             return False
     return True
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fallback catalog (deterministic; trimmed for brevity)
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Fallback catalog (deterministic)
+# -------------------------------------------------------------------
 def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
     return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
 
@@ -391,9 +282,115 @@ def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[L
         i += 1
     return picks[:n]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Step 1: Flexible query constraints (soft hints)
+# -------------------------------------------------------------------
+@dataclass
+class QueryConstraints:
+    country: str | None = None
+    brand: str | None = None
+    house: str | None = None
+    perfumer: str | None = None
+    max_price: float | None = None
+    gender: str | None = None
+    occasion: str | None = None
+    note_words: List[str] | None = None
+
+COUNTRY_HINTS = {
+    "pakistan": "PK", "pakistani": "PK", "karachi": "PK", "lahore": "PK", "islamabad": "PK",
+    "france": "FR", "paris": "FR", "india": "IN", "turkey": "TR", "saudi": "SA", "uae": "AE",
+}
+GENDER_HINTS = { "men": "men", "male": "men", "women": "women", "female": "women", "unisex": "unisex" }
+OCCASION_HINTS = {
+    "date night": "date", "date": "date",
+    "office": "office", "work": "office",
+    "gym": "gym", "summer": "summer", "winter": "winter", "club": "club"
+}
+PRICE_REGEX = r"\$?\s*(\d{2,4})\s*(?:usd|dollars)?|under\s*\$?\s*(\d{2,4})"
+
+def detect_constraints(goal: str | None, note_keys: List[str]) -> QueryConstraints:
+    if not goal:
+        return QueryConstraints()
+    g = goal.lower()
+
+    # country
+    country = next((v for k, v in COUNTRY_HINTS.items() if k in g), None)
+    # gender
+    gender = next((v for k, v in GENDER_HINTS.items() if k in g), None)
+    # occasion (prefer multi-word)
+    occasion = None
+    for k, v in sorted(OCCASION_HINTS.items(), key=lambda kv: -len(kv[0])):
+        if k in g:
+            occasion = v
+            break
+    # price
+    max_price = None
+    m = re.search(PRICE_REGEX, g)
+    if m:
+        nums = [n for n in m.groups() if n]
+        if nums:
+            try:
+                max_price = float(nums[0])
+            except:
+                pass
+    # brand/house (simple heuristic)
+    brand = None
+    for tok in ("by ", "from ", "house "):
+        idx = g.find(tok)
+        if idx != -1:
+            tail = g[idx + len(tok):].strip()
+            maybe = tail.split()
+            if maybe:
+                brand = " ".join(maybe[:3]).strip(".,!?:;")
+                break
+    # perfumer (simple heuristic)
+    perfumer = None
+    for tok in ("perfumer ", "by perfumer ", "nose "):
+        idx = g.find(tok)
+        if idx != -1:
+            tail = g[idx + len(tok):].strip()
+            maybe = tail.split()
+            if maybe:
+                perfumer = " ".join(maybe[:4]).strip(".,!?:;")
+                break
+    # explicit notes
+    note_words = []
+    for k in note_keys:
+        if k in g and k not in note_words:
+            note_words.append(k)
+
+    return QueryConstraints(
+        country=country,
+        brand=brand,
+        house=brand,
+        perfumer=perfumer,
+        max_price=max_price,
+        gender=gender,
+        occasion=occasion,
+        note_words=note_words or None
+    )
+
+# Debug endpoint: observe parser output (no behavior change)
+@app.get("/debug/constraints")
+async def debug_constraints(goal: str):
+    note_keys = list(KEYWORD_VARIANTS.keys())
+    qc = detect_constraints(goal, note_keys)
+    return {
+        "parsed": {
+            "country": qc.country,
+            "brand": qc.brand,
+            "house": qc.house,
+            "perfumer": qc.perfumer,
+            "max_price": qc.max_price,
+            "gender": qc.gender,
+            "occasion": qc.occasion,
+            "note_words": qc.note_words,
+        }
+    }
+
+# -------------------------------------------------------------------
 # LLM tool schema (recommend)
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 TOOL_SCHEMA_RECOMMEND = [
     {
         "type": "function",
@@ -453,9 +450,9 @@ Rules:
 - 3 results, each reason must clearly include all required note words (exact words or common variants).
 """.strip()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# OpenAI calls (recommend / analyze) with fallback
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# OpenAI call with enforcement + multi-root fallback
+# -------------------------------------------------------------------
 async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
     groups = _required_groups_from_goal(goal)
 
@@ -507,6 +504,9 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
 
     raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
 
+# -------------------------------------------------------------------
+# ANALYZE (for taste profile surfacing)
+# -------------------------------------------------------------------
 TOOL_SCHEMA_ANALYZE = [
     {
         "type": "function",
@@ -573,12 +573,15 @@ Rules:
             time.sleep(0.5)
     raise HTTPException(status_code=503, detail=f"AI analyze failed: {last_err}")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 # Endpoints
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest):
     profile = load_user_prefs(req.uid, req.prefs)
+    # Step 1 adds constraints parser but does not change behavior yet
+    # (We’ll wire constraints into prompt/reranker in the next step.)
+    # qc = detect_constraints(req.goal, list(KEYWORD_VARIANTS.keys()))
     return await call_openai_with_tools(req.goal, profile, req.max_results)
 
 @app.post("/analyze", response_model=AnalyzeResponse)
