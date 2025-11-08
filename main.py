@@ -1,7 +1,6 @@
 # main.py
 import os, json, time, logging, re
-from typing import List, Optional, Tuple, Pattern
-from dataclasses import dataclass
+from typing import List, Optional, Tuple, Pattern, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,13 +8,13 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load env first
+# Load .env first so all env vars are available
 load_dotenv(override=True)
 
-APP_VERSION = "1.8.0-soft-constraints+analyze"
+APP_VERSION = "2.0.0-constraints+retry+rerank"
 
 # -------------------------------------------------------------------
-# Optional Firestore (non-fatal if missing / not configured)
+# Optional Firestore (if creds are configured)
 # -------------------------------------------------------------------
 FIRESTORE_READY = False
 db = None
@@ -42,18 +41,14 @@ if FIRESTORE_IMPORT_OK:
         logging.warning("Firestore init skipped: %s", e)
 
 # -------------------------------------------------------------------
-# Optional Postgres via psycopg_pool (non-fatal)
+# Optional Postgres (only if DATABASE_URL provided)
 # -------------------------------------------------------------------
 POOL = None
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL:
     try:
         from psycopg_pool import ConnectionPool  # optional dependency
-        POOL = ConnectionPool(
-            conninfo=DATABASE_URL,
-            max_size=5,
-            kwargs={"connect_timeout": 5},
-        )
+        POOL = ConnectionPool(conninfo=DATABASE_URL, max_size=5, kwargs={"connect_timeout": 5})
         logging.info("Postgres pool enabled.")
     except Exception as e:
         logging.warning("Postgres pool disabled: %s", e)
@@ -82,7 +77,7 @@ app.add_middleware(
 )
 
 # -------------------------------------------------------------------
-# Pydantic models
+# Models (Pydantic)
 # -------------------------------------------------------------------
 class PreferencePayload(BaseModel):
     likes: List[str] = Field(default_factory=list)
@@ -116,6 +111,17 @@ class AnalyzeResponse(BaseModel):
     dominant_notes: List[str] = Field(default_factory=list)
     style_tags: List[str] = Field(default_factory=list)
     occasions: List[str] = Field(default_factory=list)
+
+# Parsed constraint hints
+class ConstraintHints(BaseModel):
+    country: Optional[str] = None        # "PK", "FR", ...
+    brand: Optional[str] = None
+    house: Optional[str] = None
+    perfumer: Optional[str] = None
+    max_price: Optional[float] = None
+    gender: Optional[str] = None         # men | women | unisex
+    occasion: Optional[str] = None       # date | office | gym | wedding | ...
+    note_words: List[str] = Field(default_factory=list)
 
 # -------------------------------------------------------------------
 # Health
@@ -157,6 +163,7 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
                 dislikes = _merge_lists(dislikes, d.get("dislikes", []))
                 owned = _merge_lists(owned, d.get("owned", []))
                 wishlist = _merge_lists(wishlist, d.get("wishlist", []))
+
             pref_doc = db.collection("users").document(uid).collection("preferences").document("default").get()
             if pref_doc.exists:
                 d2 = pref_doc.to_dict() or {}
@@ -164,23 +171,26 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
                 dislikes = _merge_lists(dislikes, d2.get("dislikes", []))
                 owned = _merge_lists(owned, d2.get("owned", []))
                 wishlist = _merge_lists(wishlist, d2.get("wishlist", []))
+
             likes = _merge_lists(likes, _collect_ids(uid, "likes"))
             dislikes = _merge_lists(dislikes, _collect_ids(uid, "dislikes"))
             owned = _merge_lists(owned, _collect_ids(uid, "owned"))
             wishlist = _merge_lists(wishlist, _collect_ids(uid, "wishlist"))
         except Exception as e:
             logging.warning("Firestore read failed: %s", e)
+
     if fallback:
         likes = _merge_lists(likes, fallback.likes)
         dislikes = _merge_lists(dislikes, fallback.dislikes)
         owned = _merge_lists(owned, fallback.owned)
         wishlist = _merge_lists(wishlist, fallback.wishlist)
+
     return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
 # -------------------------------------------------------------------
-# Keyword detection (wide coverage for natural language goals)
+# Keyword detection (wide coverage for natural language notes)
 # -------------------------------------------------------------------
-KEYWORD_VARIANTS = {
+KEYWORD_VARIANTS: Dict[str, List[str]] = {
     "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla", r"madagascar\s*vanilla"],
     "oud":       [r"oud", r"agarwood"],
     "rose":      [r"rose", r"damask\s*rose", r"turkish\s*rose"],
@@ -223,7 +233,7 @@ def _required_groups_from_goal(goal: str) -> List[Tuple[str, List[Pattern]]]:
 def _item_matches_group(text: str, pats: List[Pattern]) -> bool:
     return any(p.search(text) for p in pats)
 
-def _items_meet_requirements(items: List["Recommendation"], groups: List[Tuple[str, List[Pattern]]]) -> bool:
+def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str, List[Pattern]]]) -> bool:
     if not groups:
         return True
     for it in items:
@@ -233,32 +243,28 @@ def _items_meet_requirements(items: List["Recommendation"], groups: List[Tuple[s
     return True
 
 # -------------------------------------------------------------------
-# Fallback catalog (deterministic)
+# Deterministic fallback catalog (truncated sample)
 # -------------------------------------------------------------------
 def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
     return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
 
 FALLBACK_CATALOG = {
     "vanilla": [
-        R("Guerlain Spiritueuse Double Vanille","Rich vanilla with boozy warmth—clearly vanilla-forward.",95,"vanilla, rum, benzoin"),
+        R("Guerlain Spiritueuse Double Vanille","Rich vanilla with boozy warmth—vanilla-forward.",95,"vanilla, rum, benzoin"),
         R("Tom Ford Tobacco Vanille","Dense vanilla wrapped in tobacco and spice—deep vanilla profile.",92,"vanilla, tobacco, tonka"),
         R("Kayali Vanilla | 28","Sweet, wearable vanilla with amber warmth—vanilla signature.",90,"vanilla, amber, brown sugar"),
     ],
     "oud": [
-        R("Initio Oud for Greatness","Pronounced oud with saffron—bold, modern oud.",92,"oud, saffron, patchouli"),
-        R("Acqua di Parma Oud","Smooth oud with citrus lift—refined oud.",90,"oud, bergamot, leather"),
-        R("Montale Black Aoud","Dark rose-oud signature—classic oud presence.",88,"oud, rose, patchouli"),
+        R("Initio Oud for Greatness","Bold modern oud with saffron accents.",92,"oud, saffron, patchouli"),
+        R("Acqua di Parma Oud","Refined oud lifted by citrus.",90,"oud, bergamot, leather"),
+        R("Montale Black Aoud","Dark rose-oud signature.",88,"oud, rose, patchouli"),
     ],
     "rose": [
-        R("Frederic Malle Portrait of a Lady","Luxurious rose with patchouli—rose statement.",92,"rose, patchouli, incense"),
-        R("Diptyque Eau Rose","Airy, naturalistic rose—fresh daily rose.",89,"rose, lychee, musk"),
-        R("Le Labo Rose 31","Spice-wood rose—modern unisex rose.",88,"rose, cumin, cedar"),
+        R("Frederic Malle Portrait of a Lady","Luxurious rose with patchouli.",92,"rose, patchouli, incense"),
+        R("Diptyque Eau Rose","Airy, naturalistic rose.",89,"rose, lychee, musk"),
+        R("Le Labo Rose 31","Spice-wood rose; modern unisex.",88,"rose, cumin, cedar"),
     ],
-    "amber": [
-        R("Hermès Ambre Narguilé","Honeyed tobacco-amber—cozy amber aura.",91,"amber, honey, tobacco"),
-        R("MFK Grand Soir","Resinous amber—glowing evening amber.",90,"amber, labdanum, vanilla"),
-        R("Prada Amber Pour Homme","Clean, soapy amber—office-safe.",88,"amber, spices, musk"),
-    ],
+    # ...add more groups as you like
 }
 
 def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[List[Recommendation]]:
@@ -283,113 +289,183 @@ def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[L
     return picks[:n]
 
 # -------------------------------------------------------------------
-# Step 1: Flexible query constraints (soft hints)
+# Goal → Constraint parsing (Step 1 logic, built-in)
 # -------------------------------------------------------------------
-@dataclass
-class QueryConstraints:
-    country: str | None = None
-    brand: str | None = None
-    house: str | None = None
-    perfumer: str | None = None
-    max_price: float | None = None
-    gender: str | None = None
-    occasion: str | None = None
-    note_words: List[str] | None = None
-
-COUNTRY_HINTS = {
-    "pakistan": "PK", "pakistani": "PK", "karachi": "PK", "lahore": "PK", "islamabad": "PK",
-    "france": "FR", "paris": "FR", "india": "IN", "turkey": "TR", "saudi": "SA", "uae": "AE",
+_COUNTRY_ALIASES = {
+    # add aliases → ISO-ish tokens the LLM can echo back
+    "pakistan": "pk", "india": "in", "france": "fr", "united states": "us", "usa": "us",
+    "saudi": "sa", "saudi arabia":"sa", "uae":"ae", "united arab emirates":"ae",
+    "uk": "gb", "united kingdom": "gb", "england": "gb",
+    "italy": "it", "spain": "es", "turkey":"tr", "turkiye":"tr",
 }
-GENDER_HINTS = { "men": "men", "male": "men", "women": "women", "female": "women", "unisex": "unisex" }
-OCCASION_HINTS = {
-    "date night": "date", "date": "date",
-    "office": "office", "work": "office",
-    "gym": "gym", "summer": "summer", "winter": "winter", "club": "club"
-}
-PRICE_REGEX = r"\$?\s*(\d{2,4})\s*(?:usd|dollars)?|under\s*\$?\s*(\d{2,4})"
 
-def detect_constraints(goal: str | None, note_keys: List[str]) -> QueryConstraints:
-    if not goal:
-        return QueryConstraints()
-    g = goal.lower()
+_GENDER = {"men","male","masculine","women","female","feminine","unisex"}
+_OCCASIONS = {"date","office","work","gym","wedding","party","club","daily","signature","evening","summer","winter","fall","spring"}
 
-    # country
-    country = next((v for k, v in COUNTRY_HINTS.items() if k in g), None)
-    # gender
-    gender = next((v for k, v in GENDER_HINTS.items() if k in g), None)
-    # occasion (prefer multi-word)
-    occasion = None
-    for k, v in sorted(OCCASION_HINTS.items(), key=lambda kv: -len(kv[0])):
-        if k in g:
-            occasion = v
-            break
-    # price
-    max_price = None
-    m = re.search(PRICE_REGEX, g)
+_PRICE_PAT = re.compile(r"(?:under|max|<=|less than)\s*\$?\s*(\d+(\.\d+)?)", re.IGNORECASE)
+
+def _extract_country(text: str) -> Optional[str]:
+    t = text.lower()
+    for key, iso in _COUNTRY_ALIASES.items():
+        if key in t:
+            return iso.upper()
+    # fallback for patterns like "made in pk"
+    m = re.search(r"\b(in|from)\s+([A-Za-z][A-Za-z ]+)\b", t)
     if m:
-        nums = [n for n in m.groups() if n]
-        if nums:
-            try:
-                max_price = float(nums[0])
-            except:
-                pass
-    # brand/house (simple heuristic)
+        raw = m.group(2).strip()
+        return _COUNTRY_ALIASES.get(raw, raw[:2]).upper()
+    return None
+
+def _extract_brand_house_perfumer(text: str) -> Dict[str, Optional[str]]:
+    t = text.strip()
+    tl = t.lower()
+
     brand = None
-    for tok in ("by ", "from ", "house "):
-        idx = g.find(tok)
-        if idx != -1:
-            tail = g[idx + len(tok):].strip()
-            maybe = tail.split()
-            if maybe:
-                brand = " ".join(maybe[:3]).strip(".,!?:;")
-                break
-    # perfumer (simple heuristic)
+    house = None
     perfumer = None
-    for tok in ("perfumer ", "by perfumer ", "nose "):
-        idx = g.find(tok)
-        if idx != -1:
-            tail = g[idx + len(tok):].strip()
-            maybe = tail.split()
-            if maybe:
-                perfumer = " ".join(maybe[:4]).strip(".,!?:;")
-                break
-    # explicit notes
-    note_words = []
-    for k in note_keys:
-        if k in g and k not in note_words:
-            note_words.append(k)
 
-    return QueryConstraints(
-        country=country,
-        brand=brand,
-        house=brand,
-        perfumer=perfumer,
-        max_price=max_price,
-        gender=gender,
-        occasion=occasion,
-        note_words=note_words or None
-    )
+    # Hints like: "brand: ajmal", "house: armaf", "perfumer: alberto morillas"
+    for key in ["brand", "house", "perfumer"]:
+        m = re.search(rf"{key}\s*:\s*([A-Za-z0-9 '\-&]+)", tl)
+        if m:
+            val = m.group(1).strip()
+            if key == "brand": brand = val
+            if key == "house": house = val
+            if key == "perfumer": perfumer = val
 
-# Debug endpoint: observe parser output (no behavior change)
-@app.get("/debug/constraints")
-async def debug_constraints(goal: str):
-    note_keys = list(KEYWORD_VARIANTS.keys())
-    qc = detect_constraints(goal, note_keys)
+    # Natural phrasing: "by Alberto Morillas", "from Ajmal", "house Ajmal"
+    if perfumer is None:
+        m = re.search(r"\bby\s+([A-Za-z][A-Za-z '\-]+)\b", t, re.IGNORECASE)
+        if m:
+            perfumer = m.group(1).strip().lower()
+
+    if house is None:
+        m = re.search(r"\bhouse\s+([A-Za-z0-9 '\-&]+)\b", t, re.IGNORECASE)
+        if m:
+            house = m.group(1).strip().lower()
+
+    if (brand is None) or (brand == house):
+        m = re.search(r"\bfrom\s+([A-Za-z0-9 '\-&]+)\b", t, re.IGNORECASE)
+        if m:
+            brand = (brand or m.group(1).strip().lower())
+
     return {
-        "parsed": {
-            "country": qc.country,
-            "brand": qc.brand,
-            "house": qc.house,
-            "perfumer": qc.perfumer,
-            "max_price": qc.max_price,
-            "gender": qc.gender,
-            "occasion": qc.occasion,
-            "note_words": qc.note_words,
-        }
+        "brand": brand,
+        "house": house,
+        "perfumer": perfumer,
     }
 
+def _extract_price_gender_occasion(text: str) -> Dict[str, Optional[Any]]:
+    t = text.lower()
+    price = None
+    m = _PRICE_PAT.search(t)
+    if m:
+        try:
+            price = float(m.group(1))
+        except Exception:
+            price = None
+
+    gender = None
+    for g in _GENDER:
+        if re.search(rf"\b{re.escape(g)}\b", t):
+            gender = g
+            break
+
+    occasion = None
+    for oc in _OCCASIONS:
+        if re.search(rf"\b{re.escape(oc)}\b", t):
+            occasion = oc
+            break
+
+    return {"max_price": price, "gender": gender, "occasion": occasion}
+
+def _extract_note_words(text: str) -> List[str]:
+    words = []
+    tl = text.lower()
+    for root, pats in KEYWORD_VARIANTS.items():
+        if any(re.search(p, tl) for p in pats):
+            words.append(root)
+    return words
+
+async def analyze_goal_constraints(goal: str) -> Dict[str, Any]:
+    """Synchronous heuristics wrapped as async for consistency."""
+    if not goal:
+        return {}
+    country = _extract_country(goal)
+    brand_house_perfumer = _extract_brand_house_perfumer(goal)
+    pg = _extract_price_gender_occasion(goal)
+    notes = _extract_note_words(goal)
+
+    out: Dict[str, Any] = {
+        "country": country,
+        "brand": brand_house_perfumer["brand"],
+        "house": brand_house_perfumer["house"],
+        "perfumer": brand_house_perfumer["perfumer"],
+        "max_price": pg["max_price"],
+        "gender": pg["gender"],
+        "occasion": pg["occasion"],
+        "note_words": notes,
+    }
+    return out
+
 # -------------------------------------------------------------------
-# LLM tool schema (recommend)
+# Constraint helpers (enforcement & ranking)
+# -------------------------------------------------------------------
+def _constraints_summary(c: ConstraintHints) -> str:
+    parts = []
+    if c.country:   parts.append(f"Country: {c.country}")
+    if c.brand:     parts.append(f"Brand: {c.brand}")
+    if c.house:     parts.append(f"House: {c.house}")
+    if c.perfumer:  parts.append(f"Perfumer: {c.perfumer}")
+    if c.max_price is not None: parts.append(f"Max Price: {c.max_price}")
+    if c.gender:    parts.append(f"Gender: {c.gender}")
+    if c.occasion:  parts.append(f"Occasion: {c.occasion}")
+    if c.note_words:parts.append(f"Required Notes: {', '.join(c.note_words)}")
+    return " | ".join(parts) if parts else "—"
+
+def _violates_hard_constraints(item: Recommendation, c: ConstraintHints) -> bool:
+    """Hard constraints = country/brand/house/perfumer (if provided).
+       We require explicit mention in reason/notes to avoid hallucinated matches."""
+    blob = " ".join([item.name or "", item.reason or "", item.notes or ""]).lower()
+
+    def contains(x: Optional[str]) -> bool:
+        return (x or "").strip().lower() in blob if x else True
+
+    if c.country and not contains(c.country):
+        return True
+    if c.brand and not contains(c.brand):
+        return True
+    if c.house and not contains(c.house):
+        return True
+    if c.perfumer and not contains(c.perfumer):
+        return True
+    return False
+
+def _rerank_by_constraints(items: List[Recommendation], c: ConstraintHints) -> List[Recommendation]:
+    def score(it: Recommendation) -> int:
+        s = 0
+        text = " ".join([it.name or "", it.reason or "", it.notes or ""]).lower()
+
+        def has(word: Optional[str]) -> bool:
+            return bool(word and word.strip().lower() in text)
+
+        # strong signals
+        if has(c.country): s += 30
+        if has(c.brand): s += 30
+        if has(c.house): s += 30
+        if has(c.perfumer): s += 30
+        # note words
+        for w in c.note_words:
+            if w.lower() in text: s += 5
+        # light nudges
+        if has(c.occasion): s += 3
+        if has(c.gender): s += 2
+        return s
+
+    return sorted(items, key=score, reverse=True)
+
+# -------------------------------------------------------------------
+# LLM tool schemas
 # -------------------------------------------------------------------
 TOOL_SCHEMA_RECOMMEND = [
     {
@@ -421,14 +497,16 @@ TOOL_SCHEMA_RECOMMEND = [
 ]
 
 SYSTEM_PROMPT_RECOMMEND = """You are ScentFeed's fragrance AI.
-- If the goal mentions specific notes (e.g., "vanilla", "oud", "rose", etc.), ONLY return perfumes centered on those notes.
-- Explicitly include those note words in each reason.
-- Recommend 3 fragrances (5 max), with match_score 0–100, and short notes if useful.
-- Avoid recommending already-owned scents unless justified.
-- Use the 'propose_recommendations' tool to return results in structured JSON.
+
+Rules you MUST follow strictly:
+- If the goal or constraints include specific country/brand/house/perfumer, ONLY return fragrances that match those keys (mention them explicitly in each reason).
+- If required note words are present, each reason must explicitly include those words (or common variants).
+- Do NOT recommend already-owned scents unless strongly justified.
+- Return 3 items (max 5), each with: name, reason (1–2 sentences), match_score (0–100), and short notes if useful.
+- Use the 'propose_recommendations' tool to return strictly structured JSON.
 """
 
-def build_user_prompt(goal: str, prefs: PreferencePayload, groups: List[Tuple[str, List[Pattern]]]) -> str:
+def build_user_prompt(goal: str, prefs: PreferencePayload, groups: List[Tuple[str, List[Pattern]]], constraints: ConstraintHints) -> str:
     if groups:
         lines = []
         for root, pats in groups:
@@ -437,8 +515,11 @@ def build_user_prompt(goal: str, prefs: PreferencePayload, groups: List[Tuple[st
         req = "Required notes:\n" + "\n".join(lines)
     else:
         req = "Required notes: —"
+
     return f"""
 Goal: {goal}
+
+Parsed Constraints: {_constraints_summary(constraints)}
 
 Likes: {', '.join(prefs.likes) or '—'}
 Dislikes: {', '.join(prefs.dislikes) or '—'}
@@ -446,28 +527,31 @@ Owned: {', '.join(prefs.owned) or '—'}
 Wishlist: {', '.join(prefs.wishlist) or '—'}
 
 {req}
-Rules:
-- 3 results, each reason must clearly include all required note words (exact words or common variants).
+
+STRICTNESS:
+- Enforce all provided hard keys first: Country/Brand/House/Perfumer.
+- Enforce required note words in each reason.
+- If not enough candidates exist, prefer closest matches and say why, but DO NOT ignore hard keys silently.
 """.strip()
 
 # -------------------------------------------------------------------
-# OpenAI call with enforcement + multi-root fallback
+# OpenAI call with enforcement + retry + rerank + fallback
 # -------------------------------------------------------------------
-async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
+async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int, constraints: ConstraintHints) -> RecommendResponse:
     groups = _required_groups_from_goal(goal)
 
     def _msgs(extra: str = ""):
         return [
             {"role": "system", "content": SYSTEM_PROMPT_RECOMMEND},
-            {"role": "user", "content": build_user_prompt(goal, prefs, groups) + (("\n\n" + extra) if extra else "")}
+            {"role": "user", "content": build_user_prompt(goal, prefs, groups, constraints) + (("\n\n" + extra) if extra else "")}
         ]
 
     attempts = [
         "",
-        "Ensure every fragrance reason explicitly includes all required note words mentioned in the goal.",
-        "STRICT: only return items where each reason clearly contains each required note word.",
+        "STRICT: Re-check and ONLY return items that satisfy Country/Brand/House/Perfumer if provided, and include each required note word explicitly.",
     ]
 
+    last_items: List[Recommendation] = []
     for note in attempts:
         try:
             resp = oai.chat.completions.create(
@@ -491,21 +575,45 @@ async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_result
                 )
                 for it in raw_items
             ]
-            if items and _items_meet_requirements(items, groups):
-                return RecommendResponse(items=items, used_profile=prefs)
+            if not items:
+                continue
+
+            # Hard filter (country/brand/house/perfumer must be mentioned if provided)
+            filtered = [it for it in items if not _violates_hard_constraints(it, constraints)]
+
+            # If we requested any hard keys, prefer strictly valid; otherwise accept if notes satisfied.
+            any_hard = any([constraints.country, constraints.brand, constraints.house, constraints.perfumer])
+
+            if any_hard:
+                # If nothing strictly valid, keep items but try another attempt
+                if filtered:
+                    ranked = _rerank_by_constraints(filtered, constraints)
+                    return RecommendResponse(items=ranked[:max_results], used_profile=prefs)
+            else:
+                # No hard keys: validate required notes if present
+                if _items_meet_requirements(items, groups):
+                    ranked = _rerank_by_constraints(items, constraints)
+                    return RecommendResponse(items=ranked[:max_results], used_profile=prefs)
+
+            last_items = items
         except Exception:
             time.sleep(0.25)
 
-    # Deterministic multi-root fallback
-    if groups:
-        fb = _fallback_for(groups, max_results)
-        if fb:
-            return RecommendResponse(items=fb, used_profile=prefs)
+    # Final attempt: return best we have, reranked
+    if last_items:
+        ranked = _rerank_by_constraints(last_items, constraints)
+        return RecommendResponse(items=ranked[:max_results], used_profile=prefs)
 
-    raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
+    # Deterministic fallback if available
+    fb = _fallback_for(groups, max_results)
+    if fb:
+        ranked = _rerank_by_constraints(fb, constraints)
+        return RecommendResponse(items=ranked[:max_results], used_profile=prefs)
+
+    raise HTTPException(status_code=422, detail="No valid recommendations after enforcing constraints.")
 
 # -------------------------------------------------------------------
-# ANALYZE (for taste profile surfacing)
+# Analyze (taste surfacing)
 # -------------------------------------------------------------------
 TOOL_SCHEMA_ANALYZE = [
     {
@@ -579,10 +687,12 @@ Rules:
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest):
     profile = load_user_prefs(req.uid, req.prefs)
-    # Step 1 adds constraints parser but does not change behavior yet
-    # (We’ll wire constraints into prompt/reranker in the next step.)
-    # qc = detect_constraints(req.goal, list(KEYWORD_VARIANTS.keys()))
-    return await call_openai_with_tools(req.goal, profile, req.max_results)
+    try:
+        parsed = await analyze_goal_constraints(req.goal)   # Step 1 parser (built-in)
+        constraints = ConstraintHints(**parsed)
+    except Exception:
+        constraints = ConstraintHints()
+    return await call_openai_with_tools(req.goal, profile, req.max_results, constraints)
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
