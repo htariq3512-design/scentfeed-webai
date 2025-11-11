@@ -1,36 +1,31 @@
 # main.py
-import os
-import json
-import time
-import re
-import logging
-import asyncio
-from typing import List, Optional, Tuple, Pattern
+import os, json, time, logging, re
+from typing import List, Optional, Tuple, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from openai import OpenAI
 
-# -----------------------------
-# Env + Version
-# -----------------------------
+# Load .env first so all env vars are available
 load_dotenv(override=True)
-APP_VERSION = "1.8.0-guard-timeouts+lite"
 
-# -----------------------------
-# Optional Firestore
-# -----------------------------
+APP_VERSION = "2.0.0-semantic-flex+enforce"
+
+# -------------------------------------------------------------------
+# Optional Firestore (non-fatal if not configured)
+# -------------------------------------------------------------------
 FIRESTORE_READY = False
 db = None
 try:
     from firebase_admin import credentials, initialize_app
     from google.cloud import firestore
-    FIRESTORE_IMPORT_OK = True
+    FIREBASE_IMPORT_OK = True
 except Exception:
-    FIRESTORE_IMPORT_OK = False
+    FIREBASE_IMPORT_OK = False
 
-if FIRESTORE_IMPORT_OK:
+if FIREBASE_IMPORT_OK:
     try:
         svc_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
         if svc_json:
@@ -45,53 +40,33 @@ if FIRESTORE_IMPORT_OK:
     except Exception as e:
         logging.warning("Firestore init skipped: %s", e)
 
-# -----------------------------
-# Optional Postgres (non-blocking)
-# -----------------------------
+# -------------------------------------------------------------------
+# Optional Postgres via psycopg_pool (disabled if no DATABASE_URL)
+# -------------------------------------------------------------------
 POOL = None
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL:
     try:
-        from psycopg_pool import ConnectionPool  # optional, best-effort
-        POOL = ConnectionPool(
-            conninfo=DATABASE_URL,
-            max_size=4,
-            kwargs={"connect_timeout": 5},
-        )
+        from psycopg_pool import ConnectionPool
+        POOL = ConnectionPool(conninfo=DATABASE_URL, max_size=5, kwargs={"connect_timeout": 5})
         logging.info("Postgres pool enabled.")
     except Exception as e:
         logging.warning("Postgres pool disabled: %s", e)
 else:
     logging.info("DATABASE_URL not set; Postgres disabled.")
 
-# -----------------------------
-# OpenAI client + hard timeout wrapper
-# -----------------------------
-from openai import OpenAI
-
+# -------------------------------------------------------------------
+# OpenAI client
+# -------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing.")
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# Hard caps; tweak via env if needed
-OPENAI_HARD_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT_SEC", "8.0"))
-ENDPOINT_GUARD_TIMEOUT = float(os.getenv("ENDPOINT_TIMEOUT_SEC", "12.0"))
-
-async def _oai_chat(**kwargs):
-    """
-    Run OpenAI chat call in a thread with a strict asyncio timeout.
-    Prevents indefinite hangs due to upstream slowness.
-    """
-    loop = asyncio.get_event_loop()
-    def _call():
-        return oai.chat.completions.create(**kwargs)
-    return await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=OPENAI_HARD_TIMEOUT)
-
-# -----------------------------
-# FastAPI app + CORS
-# -----------------------------
+# -------------------------------------------------------------------
+# FastAPI app & CORS
+# -------------------------------------------------------------------
 app = FastAPI(title="ScentFeed Web AI", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -101,9 +76,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Pydantic models
-# -----------------------------
+# -------------------------------------------------------------------
+# Pydantic models (request/response)
+# -------------------------------------------------------------------
 class PreferencePayload(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
@@ -125,6 +100,7 @@ class Recommendation(BaseModel):
 class RecommendResponse(BaseModel):
     items: List[Recommendation]
     used_profile: PreferencePayload
+    facets: Dict[str, Any] = Field(default_factory=dict)
 
 class AnalyzeRequest(BaseModel):
     uid: Optional[str] = None
@@ -137,24 +113,23 @@ class AnalyzeResponse(BaseModel):
     style_tags: List[str] = Field(default_factory=list)
     occasions: List[str] = Field(default_factory=list)
 
-# -----------------------------
+# -------------------------------------------------------------------
 # Health
-# -----------------------------
+# -------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
 
-# -----------------------------
-# Firestore helpers (best-effort)
-# -----------------------------
+# -------------------------------------------------------------------
+# Helpers: merge lists + Firestore reads
+# -------------------------------------------------------------------
 def _merge_lists(a: Optional[List[str]], b: Optional[List[str]]) -> List[str]:
     out, seen = [], set()
-    for lst in ((a or []), (b or [])):
+    for lst in (a or []), (b or []):
         for x in lst:
             k = x.strip().lower()
             if k and k not in seen:
-                seen.add(k)
-                out.append(x.strip())
+                seen.add(k); out.append(x.strip())
     return out
 
 def _collect_ids(uid: str, sub: str) -> List[str]:
@@ -185,7 +160,6 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
                 dislikes = _merge_lists(dislikes, d2.get("dislikes", []))
                 owned = _merge_lists(owned, d2.get("owned", []))
                 wishlist = _merge_lists(wishlist, d2.get("wishlist", []))
-            # Merge subcollections as IDs if used
             likes = _merge_lists(likes, _collect_ids(uid, "likes"))
             dislikes = _merge_lists(dislikes, _collect_ids(uid, "dislikes"))
             owned = _merge_lists(owned, _collect_ids(uid, "owned"))
@@ -199,99 +173,104 @@ def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -
         wishlist = _merge_lists(wishlist, fallback.wishlist)
     return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-# -----------------------------
-# Keyword detection (broad)
-# -----------------------------
-KEYWORD_VARIANTS = {
-    "vanilla":   [r"vanilla", r"vanillic", r"vanilla\s*bean", r"bourbon\s*vanilla"],
-    "oud":       [r"oud", r"agarwood"],
-    "rose":      [r"rose", r"damask\s*rose", r"turkish\s*rose"],
-    "amber":     [r"amber", r"ambery"],
-    "citrus":    [r"citrus", r"bergamot", r"lemon", r"neroli", r"grapefruit"],
-    "woody":     [r"woody", r"cedarwood", r"sandalwood", r"oakwood"],
-    "spicy":     [r"spicy", r"pepper", r"cardamom", r"cinnamon", r"clove"],
-    "gourmand":  [r"gourmand", r"chocolate", r"caramel", r"praline"],
-    "musk":      [r"musk", r"musky"],
-    "aquatic":   [r"aquatic", r"marine", r"ozonic"],
-}
+# -------------------------------------------------------------------
+# Lightweight facet detection (scales without hardcoding everything)
+# -------------------------------------------------------------------
+_COUNTRY_OR_REGION = [
+    # broad regions
+    r"middle\s*east", r"arab(ic|ian)?", r"gulf", r"french", r"italian", r"japanese",
+    r"indian", r"pakistan(i)?", r"turkish", r"korean", r"british", r"american",
+    r"saudi", r"emirati|uae", r"kuwait(i)?", r"qatar(i)?", r"oman(i)?", r"egypt(ian)?",
+]
+_OCCASIONS = [
+    r"eid", r"ramadan", r"wedding", r"anniversary", r"birthday", r"date", r"office|work",
+    r"school|class", r"gym|workout", r"interview", r"party", r"christmas|xmas|holiday",
+]
+_SEASONS = [r"spring", r"summer", r"fall|autumn", r"winter", r"rain|monsoon"]
+_BUDGET = r"(?:under|below|<=?|less than)\s*\$?(\d{2,4})"
+_PROJECTION = [r"beast\s*mode", r"strong\s*projection", r"soft\s*projection", r"intimate|skin\s*scent", r"moderate\s*projection"]
+_LONGEVITY = [r"long\s*lasting|12\+?\s*h", r"8\s*h", r"all\s*day", r"short\s*lasting|2-3\s*h"]
+_NOTES_HINT = [r"vanilla", r"oud|oudh|agarwood", r"rose", r"amber|ambery", r"musk", r"citrus|bergamot|lemon|orange|grapefruit|lime|neroli", r"leather|suede",
+               r"iris|orris", r"vetiver", r"sandalwood|santal", r"jasmine|jasmin", r"patchouli", r"incense|olibanum|frankincense",
+               r"gourmand|chocolate|caramel|praline", r"coconut", r"almond|heliotrope", r"cherry|apple|peach|pear",
+               r"woody|cedar|guaiac|oak", r"aquatic|marine|ozonic", r"green|fig", r"spicy|pepper|cardamom|cinnamon|clove"]
 
-def _required_groups_from_goal(goal: str) -> List[Tuple[str, List[Pattern]]]:
-    g = (goal or "").lower()
-    groups: List[Tuple[str, List[Pattern]]] = []
-    for root, patterns in KEYWORD_VARIANTS.items():
-        if any(re.search(p, g) for p in patterns):
-            compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-            groups.append((root, compiled))
-    return groups
+_BRAND_OR_HOUSE_HINT = r"(?:brand|house)\s*[:\-]\s*([A-Za-z0-9&\.\-\s]{2,})"
+_PERFUMER_HINT = r"(?:perfumer|by)\s*[:\-]?\s*([A-Z][A-Za-z\.\-\s]{2,})"
 
-def _item_matches_group(text: str, pats: List[Pattern]) -> bool:
-    return any(p.search(text) for p in pats)
+def _extract_facets(goal: str) -> Dict[str, Any]:
+    g = goal.lower()
+    facets: Dict[str, Any] = {}
 
-def _items_meet_requirements(items: List[Recommendation], groups: List[Tuple[str, List[Pattern]]]) -> bool:
-    if not groups:
-        return True
-    for it in items:
-        blob = " ".join([it.name or "", it.reason or "", it.notes or ""])
-        # Must mention every *root* somewhere
-        for _, pats in groups:
-            if not _item_matches_group(blob, pats):
-                return False
-    return True
+    # Countries/regions
+    regions = set()
+    for pat in _COUNTRY_OR_REGION:
+        if re.search(pat, g, re.IGNORECASE):
+            regions.add(re.search(pat, g, re.IGNORECASE).group(0))
+    if regions:
+        facets["regions"] = sorted(regions)
 
-# -----------------------------
-# Deterministic fallback catalog
-# -----------------------------
-def R(name: str, reason: str, score: int, notes: str) -> Recommendation:
-    return Recommendation(name=name, reason=reason, match_score=score, notes=notes)
+    # Occasions
+    occs = set()
+    for pat in _OCCASIONS:
+        if re.search(pat, g, re.IGNORECASE):
+            occs.add(re.search(pat, g, re.IGNORECASE).group(0))
+    if occs:
+        facets["occasions"] = sorted(occs)
 
-FALLBACK_CATALOG = {
-    "vanilla": [
-        R("Kayali Vanilla | 28", "Sweet vanilla signature with warm amber tones; clearly vanilla-forward.", 91, "vanilla, amber, brown sugar"),
-        R("Tom Ford Tobacco Vanille", "Dense vanilla wrapped in tobacco and spice—deep vanilla profile.", 90, "vanilla, tobacco, tonka"),
-        R("Guerlain Spiritueuse Double Vanille", "Rich boozy vanilla—vanilla leads the composition.", 92, "vanilla, rum, benzoin"),
-    ],
-    "oud": [
-        R("Initio Oud for Greatness", "Modern oud with saffron; oud is the star.", 92, "oud, saffron, patchouli"),
-        R("Montale Black Aoud", "Dark rose-oud classic; unmistakably oud-laden.", 89, "oud, rose, patchouli"),
-        R("Acqua di Parma Oud", "Refined oud smoothed by citrus and leather.", 88, "oud, citrus, leather"),
-    ],
-    "rose": [
-        R("Frederic Malle Portrait of a Lady", "Luxurious rose center with patchouli; rose-forward statement.", 92, "rose, patchouli, incense"),
-        R("Diptyque Eau Rose", "Airy daily rose; transparent rose signature.", 89, "rose, lychee, musk"),
-        R("Le Labo Rose 31", "Spiced, woody rose; modern unisex rose core.", 88, "rose, cumin, cedar"),
-    ],
-}
+    # Season
+    seasons = set()
+    for pat in _SEASONS:
+        if re.search(pat, g, re.IGNORECASE):
+            seasons.add(re.search(pat, g, re.IGNORECASE).group(0))
+    if seasons:
+        facets["seasons"] = sorted(seasons)
 
-def _fallback_for(groups: List[Tuple[str, List[Pattern]]], n: int) -> Optional[List[Recommendation]]:
-    if not groups:
-        return None
-    roots = [r for r, _ in groups]
-    catalogs = [FALLBACK_CATALOG.get(r, []) for r in roots]
-    if any(len(c) == 0 for c in catalogs):
-        return None
-    picks: List[Recommendation] = []
-    i = 0
-    while len(picks) < n:
-        cat = catalogs[i % len(catalogs)]
-        idx = (len(picks) // len(catalogs)) % len(cat)
-        base = cat[idx]
-        reason = base.reason
-        for r in roots:
-            if r not in reason.lower():
-                reason += f" Includes clear {r} facets."
-        picks.append(Recommendation(name=base.name, reason=reason, match_score=base.match_score, notes=base.notes))
-        i += 1
-    return picks[:n]
+    # Budget
+    b = re.search(_BUDGET, g, re.IGNORECASE)
+    if b:
+        try:
+            facets["budget_max"] = int(b.group(1))
+        except Exception:
+            pass
 
-# -----------------------------
-# Tool schema + prompts
-# -----------------------------
+    # Projection/Longevity
+    proj = [p for p in _PROJECTION if re.search(p, g, re.IGNORECASE)]
+    if proj:
+        facets["projection"] = proj
+    longv = [p for p in _LONGEVITY if re.search(p, g, re.IGNORECASE)]
+    if longv:
+        facets["longevity"] = longv
+
+    # Notes present in the query
+    notes = set()
+    for pat in _NOTES_HINT:
+        if re.search(pat, g, re.IGNORECASE):
+            notes.add(re.search(pat, g, re.IGNORECASE).group(0))
+    if notes:
+        facets["notes"] = sorted(notes)
+
+    # Brand/House (explicit)
+    bh = re.search(_BRAND_OR_HOUSE_HINT, goal, re.IGNORECASE)
+    if bh:
+        facets["brand_or_house"] = bh.group(1).strip()
+
+    # Perfumer (explicit)
+    pf = re.search(_PERFUMER_HINT, goal, re.IGNORECASE)
+    if pf:
+        facets["perfumer"] = pf.group(1).strip()
+
+    return facets
+
+# -------------------------------------------------------------------
+# LLM tool schema (recommend)
+# -------------------------------------------------------------------
 TOOL_SCHEMA_RECOMMEND = [
     {
         "type": "function",
         "function": {
             "name": "propose_recommendations",
-            "description": "Return 3–5 fragrance recommendations tailored to the user's taste.",
+            "description": "Return 3–5 fragrance recommendations tailored to the user's taste and facets.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -305,7 +284,7 @@ TOOL_SCHEMA_RECOMMEND = [
                                 "match_score": {"type": "integer"},
                                 "notes": {"type": "string"}
                             },
-                            "required": ["name", "reason", "match_score"]
+                            "required": ["name","reason","match_score"]
                         }
                     }
                 },
@@ -316,34 +295,120 @@ TOOL_SCHEMA_RECOMMEND = [
 ]
 
 SYSTEM_PROMPT_RECOMMEND = """You are ScentFeed's fragrance AI.
-- If the goal contains specific note words (e.g., vanilla, oud, rose, amber, woody, citrus, spicy, etc.), ONLY return perfumes centered on those notes, and explicitly include those words in each reason.
-- Recommend 3 fragrances (5 max), scores 0–100.
-- Avoid recommending already-owned items unless strongly justified.
-- Use the 'propose_recommendations' tool to return JSON.
+
+You MUST interpret any user goal as free text that may include:
+- notes/themes (e.g., vanilla, oud, musk),
+- occasions/contexts (e.g., Eid, Christmas, gym, office, date, wedding),
+- region/country/house identity (e.g., Pakistani, Middle Eastern, French, 'house: X'),
+- perfumer names (e.g., 'by Dominique Ropion'),
+- tone & performance (fresh, cozy, bold, beast mode, soft projection, long-lasting),
+- price/budget (e.g., 'under $100').
+
+REQUIREMENTS:
+- Identify ALL relevant facets and reflect them in selection and reasoning.
+- If region/country is mentioned (e.g., 'Pakistani', 'Middle Eastern'), prioritize brands/houses or styles authentic to that context and EXPLAIN why in the reason (e.g., “Pakistani house …”, “Middle Eastern oud style …”).
+- If a brand/house or perfumer is named, prioritize matching items (avoid random big designers unless relevant).
+- If an occasion is present (e.g., Eid, interview, gym), align projection/notes to that context and SAY SO.
+- 3 results by default (5 max). match_score 0–100. Keep reasons specific and useful. Include concise 'notes' if helpful.
+- Avoid recommending already-owned scents unless the profile indicates exceptions.
+- Output via the 'propose_recommendations' tool only.
 """
 
-def build_user_prompt(goal: str, prefs: PreferencePayload, groups: List[Tuple[str, List[Pattern]]]) -> str:
-    if groups:
-        lines = []
-        for root, pats in groups:
-            demo = ", ".join([p.pattern.replace("\\s*", " ").strip("^$") for p in pats[:3]])
-            lines.append(f"- Must explicitly mention: {root} (e.g., {demo})")
-        req = "Required notes:\n" + "\n".join(lines)
-    else:
-        req = "Required notes: —"
+def _build_user_prompt(goal: str, prefs: PreferencePayload, facets: Dict[str, Any]) -> str:
+    def fmt_list(x): return ", ".join(x) if x else "—"
+    ftxt = json.dumps(facets, ensure_ascii=False)
     return f"""
-Goal: {goal}
+User goal: {goal}
 
-Likes: {', '.join(prefs.likes) or '—'}
-Dislikes: {', '.join(prefs.dislikes) or '—'}
-Owned: {', '.join(prefs.owned) or '—'}
-Wishlist: {', '.join(prefs.wishlist) or '—'}
+Extracted facets (use these to guide selection; do not ignore): {ftxt}
 
-{req}
+User profile:
+- Likes: {fmt_list(prefs.likes)}
+- Dislikes: {fmt_list(prefs.dislikes)}
+- Owned: {fmt_list(prefs.owned)}
+- Wishlist: {fmt_list(prefs.wishlist)}
+
 Rules:
-- 3 results, each reason must clearly include all required note words (exact or common variants).
+- Return 3 items unless the user asked otherwise.
+- Reasons must explicitly tie back to the facets when present (e.g., mention country/house/occasion/perfumer/price/performance).
+- If country/region present (e.g., Pakistan), prefer relevant brands/houses or culturally aligned styles and SAY that in the reason.
+- Keep responses concise, factual, and helpful.
 """.strip()
 
+def _reask_note(facets: Dict[str, Any]) -> str:
+    asks = []
+    if "regions" in facets:
+        asks.append("Ensure each reason explicitly states how the item is connected to the specified region/country (brand origin, house identity, or regional style).")
+    if "brand_or_house" in facets:
+        asks.append("Prioritize items from the named brand/house or directly related lines; explain the relation in the reason.")
+    if "perfumer" in facets:
+        asks.append("Prioritize compositions by the named perfumer (or clearly explain direct involvement/collaboration).")
+    if "occasions" in facets:
+        asks.append("State why the item fits the specific occasion(s).")
+    if "budget_max" in facets:
+        asks.append(f"Respect budget: under ${facets['budget_max']} where possible; mention pricing tier if relevant.")
+    if "notes" in facets:
+        asks.append("Explicitly reference the requested notes in each reason when relevant.")
+    if not asks:
+        return "Ensure reasons explicitly tie to the user's phrasing and intent."
+    return " ".join(asks)
+
+# -------------------------------------------------------------------
+# Call OpenAI with facet enforcement + retry
+# -------------------------------------------------------------------
+async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
+    facets = _extract_facets(goal)
+
+    def msgs(extra: str = ""):
+        content = _build_user_prompt(goal, prefs, facets)
+        if extra:
+            content += ("\n\n" + extra)
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT_RECOMMEND},
+            {"role": "user", "content": content}
+        ]
+
+    attempts = [
+        "",  # baseline
+        _reask_note(facets),  # facet-aware enforcement
+        "STRICT: Align each item and reason with the extracted facets. If region/brand/perfumer is present, make the connection explicit; otherwise choose another item."
+    ]
+
+    last_err: Optional[Exception] = None
+    for note in attempts:
+        try:
+            resp = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.0,
+                messages=msgs(note),
+                tools=TOOL_SCHEMA_RECOMMEND,
+                tool_choice={"type": "function", "function": {"name": "propose_recommendations"}},
+            )
+            choice = resp.choices[0]
+            if not choice.message.tool_calls:
+                raise RuntimeError("Model did not call the recommend tool.")
+            args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
+            raw_items = args.get("items", [])[:max_results]
+            items = [
+                Recommendation(
+                    name=(it.get("name") or "").strip(),
+                    reason=(it.get("reason") or "").strip(),
+                    match_score=int(it.get("match_score", 0)),
+                    notes=((it.get("notes") or "").strip() or None),
+                )
+                for it in raw_items
+            ]
+            if items:
+                return RecommendResponse(items=items, used_profile=prefs, facets=facets)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.25)
+
+    raise HTTPException(status_code=422, detail=f"Recommendation generation failed. Last error: {last_err}")
+
+# -------------------------------------------------------------------
+# ANALYZE (unchanged, concise profile surfacing)
+# -------------------------------------------------------------------
 TOOL_SCHEMA_ANALYZE = [
     {
         "type": "function",
@@ -366,69 +431,11 @@ TOOL_SCHEMA_ANALYZE = [
 
 ANALYZE_SYSTEM_PROMPT = """You are ScentFeed's taste analyst.
 - Read likes, dislikes, owned, wishlist.
-- Infer a concise taste profile with specific note and style tendencies.
-- Do not repeat raw lists; interpret them.
-- Return results via the 'propose_profile' tool.
+- Infer a concise taste profile (notes and styles).
+- Avoid repeating the raw lists; interpret them.
+- Be specific and helpful.
+- Return results via the propose_profile tool.
 """
-
-# -----------------------------
-# OpenAI flows (with hard timeouts)
-# -----------------------------
-async def call_openai_with_tools(goal: str, prefs: PreferencePayload, max_results: int) -> RecommendResponse:
-    groups = _required_groups_from_goal(goal)
-
-    def _msgs(extra: str = ""):
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT_RECOMMEND},
-            {"role": "user", "content": build_user_prompt(goal, prefs, groups) + (("\n\n" + extra) if extra else "")}
-        ]
-
-    attempts = [
-        "",
-        "Ensure every fragrance reason explicitly includes all required note words mentioned in the goal.",
-        "STRICT: only return items where each reason clearly contains each required note word.",
-    ]
-
-    for note in attempts:
-        try:
-            resp = await _oai_chat(
-                model=OPENAI_MODEL,
-                temperature=0.0,
-                messages=_msgs(note),
-                tools=TOOL_SCHEMA_RECOMMEND,
-                tool_choice={"type": "function", "function": {"name": "propose_recommendations"}},
-            )
-            choice = resp.choices[0]
-            if not choice.message.tool_calls:
-                raise RuntimeError("Model did not call the recommend tool.")
-            args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-            raw_items = args.get("items", [])[:max_results]
-            items = [
-                Recommendation(
-                    name=(it.get("name") or "").strip(),
-                    reason=(it.get("reason") or "").strip(),
-                    match_score=int(it.get("match_score", 0)),
-                    notes=((it.get("notes") or "").strip() or None),
-                )
-                for it in raw_items
-            ]
-            if items and _items_meet_requirements(items, groups):
-                return RecommendResponse(items=items, used_profile=prefs)
-        except asyncio.TimeoutError:
-            # Hard timeout at the call level — let the endpoint guard handle overall cap.
-            break
-        except Exception:
-            # Soft retry on formatting/model hiccups
-            time.sleep(0.2)
-
-    # Deterministic fallback if we have clear note roots
-    if groups:
-        fb = _fallback_for(groups, max_results)
-        if fb:
-            return RecommendResponse(items=fb, used_profile=prefs)
-
-    # If we reach here, we failed both AI & fallback
-    raise HTTPException(status_code=422, detail="Required note keywords were not satisfied and no fallback catalog was available.")
 
 async def call_openai_analyze(prefs: PreferencePayload, max_tags: int) -> AnalyzeResponse:
     user_msg = f"""
@@ -441,64 +448,45 @@ Rules:
 - Provide 2–4 sentence summary.
 - Suggest concise dominant_notes (<= {max_tags}), style_tags (<= {max_tags}), occasions (<= {max_tags}).
 """
-    try:
-        resp = await _oai_chat(
-            model=OPENAI_MODEL,
-            temperature=0.4,
-            messages=[
-                {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            tools=TOOL_SCHEMA_ANALYZE,
-            tool_choice={"type": "function", "function": {"name": "propose_profile"}},
-        )
-        choice = resp.choices[0]
-        if not choice.message.tool_calls:
-            raise RuntimeError("Model did not call the analysis tool.")
-        args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-        summary = (args.get("summary") or "").strip() or "We analyzed your recent activity to identify your core scent preferences."
-        dominant_notes = [str(x).strip() for x in (args.get("dominant_notes") or [])][:max_tags]
-        style_tags = [str(x).strip() for x in (args.get("style_tags") or [])][:max_tags]
-        occasions = [str(x).strip() for x in (args.get("occasions") or [])][:max_tags]
-        return AnalyzeResponse(summary=summary, dominant_notes=dominant_notes, style_tags=style_tags, occasions=occasions)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Upstream timeout during analyze.")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Analyze failed: {e}")
+    last_err: Optional[Exception] = None
+    for _ in range(2):
+        try:
+            resp = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ],
+                tools=TOOL_SCHEMA_ANALYZE,
+                tool_choice={"type": "function", "function": {"name": "propose_profile"}}
+            )
+            choice = resp.choices[0]
+            if not choice.message.tool_calls:
+                raise RuntimeError("Model did not call the analysis tool.")
+            args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
+            summary = str(args.get("summary","")).strip() or "We analyzed your recent activity to identify your core scent preferences."
+            dominant_notes = [str(x).strip() for x in args.get("dominant_notes", [])][:max_tags]
+            style_tags = [str(x).strip() for x in args.get("style_tags", [])][:max_tags]
+            occasions = [str(x).strip() for x in args.get("occasions", [])][:max_tags]
+            return AnalyzeResponse(summary=summary, dominant_notes=dominant_notes, style_tags=style_tags, occasions=occasions)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    raise HTTPException(status_code=503, detail=f"AI analyze failed: {last_err}")
 
-# -----------------------------
-# Endpoints (with guard timeout + lite mode)
-# -----------------------------
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
 @app.post("/recommend", response_model=RecommendResponse)
-async def recommend(req: RecommendRequest, lite: bool = Query(False, description="Skip enrichment for fast path")):
-    async def _impl():
-        # In the future, use `lite` to skip any slow vendor enrichment before calling OpenAI.
-        profile = load_user_prefs(req.uid, req.prefs)
-        return await call_openai_with_tools(req.goal, profile, req.max_results)
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=ENDPOINT_GUARD_TIMEOUT)
-    except asyncio.TimeoutError:
-        # Hard stop to prevent “hang forever”
-        raise HTTPException(status_code=504, detail="Upstream timeout")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Unexpected error: {e}")
+async def recommend(req: RecommendRequest):
+    profile = load_user_prefs(req.uid, req.prefs)
+    return await call_openai_with_tools(req.goal, profile, req.max_results)
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    async def _impl():
-        profile = load_user_prefs(req.uid, req.prefs)
-        return await call_openai_analyze(profile, req.max_tags)
+    profile = load_user_prefs(req.uid, req.prefs)
+    return await call_openai_analyze(profile, req.max_tags)
 
-    try:
-        return await asyncio.wait_for(_impl(), timeout=ENDPOINT_GUARD_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Upstream timeout")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Unexpected error: {e}")
 
 
