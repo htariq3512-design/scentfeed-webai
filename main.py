@@ -1,347 +1,289 @@
 # main.py
-import os, json, time, logging, re
-from typing import List, Optional, Tuple, Pattern
-
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from typing import List, Optional, Dict, Any
+import os
+import time
+
 from openai import OpenAI
 
-load_dotenv(override=True)
+# ---------- OpenAI client ----------
 
-APP_VERSION = "1.8.0-filters+strict"
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# ---------- Optional Firestore ----------
-FIRESTORE_READY = False
-db = None
-try:
-    from firebase_admin import credentials, initialize_app
-    from google.cloud import firestore
-    FIRESTORE_IMPORT_OK = True
-except Exception:
-    FIRESTORE_IMPORT_OK = False
+# ---------- FastAPI app ----------
 
-if FIRESTORE_IMPORT_OK:
-    try:
-        svc_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
-        if svc_json:
-            cred = credentials.Certificate(json.loads(svc_json))
-            initialize_app(cred)
-            db = firestore.Client()
-            FIRESTORE_READY = True
-        elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-            initialize_app()
-            db = firestore.Client()
-            FIRESTORE_READY = True
-    except Exception as e:
-        logging.warning("Firestore init skipped: %s", e)
+app = FastAPI(title="ScentFeed Web AI", version="1.8.0")
 
-# ---------- Optional Postgres ----------
-POOL = None
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if DATABASE_URL:
-    try:
-        from psycopg_pool import ConnectionPool
-        POOL = ConnectionPool(conninfo=DATABASE_URL, max_size=5, kwargs={"connect_timeout": 5})
-        logging.info("Postgres pool enabled.")
-    except Exception as e:
-        logging.warning("Postgres pool disabled: %s", e)
-else:
-    logging.info("DATABASE_URL not set; Postgres disabled.")
+# ---------- Pydantic models (wire contract with the iOS app) ----------
 
-# ---------- OpenAI ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing.")
-oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- FastAPI ----------
-app = FastAPI(title="ScentFeed Web AI", version=APP_VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- Models ----------
-class PreferencePayload(BaseModel):
+class Prefs(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
     owned: List[str] = Field(default_factory=list)
     wishlist: List[str] = Field(default_factory=list)
 
-class FilterPayload(BaseModel):
-    # All optional – add only what the client sets.
-    price_min: Optional[float] = Field(default=None, ge=0)
-    price_max: Optional[float] = Field(default=None, ge=0)
-    stores: Optional[List[str]] = None          # e.g., ["Sephora","FragranceX"]
-    houses: Optional[List[str]] = None          # brands/houses
-    niche: Optional[bool] = None                # True niche, False designer, None any
-    concentration: Optional[str] = None         # "EDT"|"EDP"|"Parfum"|etc.
-    season: Optional[str] = None                # "spring"|"summer"|"fall"|"winter"
-    occasion: Optional[str] = None              # "office"|"date"|"wedding"|...
-    projection: Optional[str] = None            # "soft"|"moderate"|"strong"
-    longevity: Optional[str] = None             # "short"|"moderate"|"long"
-    region: Optional[str] = None                # "PK"|"FR"|"US"|full names also ok
-    gender_positioning: Optional[str] = None    # "masc"|"fem"|"uni"
+
+class RecommendFilters(BaseModel):
+    """
+    Placeholder for future filters. Right now we accept it
+    and pass it into the model as metadata, but we don't
+    hard-enforce on the backend. This keeps the contract
+    forward-compatible.
+    """
+    # Example optional fields – keep them very loose for now
+    gender: Optional[str] = None          # "male" | "female" | "unisex"
+    region: Optional[str] = None          # "pakistan", "gulf", "europe"...
+    price_band: Optional[str] = None      # "budget", "mid", "luxury"
+    raw: Optional[Dict[str, Any]] = None  # any extra future stuff
+
 
 class RecommendRequest(BaseModel):
     uid: Optional[str] = None
-    goal: str = Field(default="Suggest 3 fragrances.")
-    max_results: int = Field(default=3, ge=1, le=5)
-    prefs: Optional[PreferencePayload] = None
-    filters: Optional[FilterPayload] = None     # <— NEW
+    goal: str
+    max_results: int = 3
+    prefs: Prefs
+    filters: Optional[RecommendFilters] = None
 
-class Recommendation(BaseModel):
+
+class RecommendItem(BaseModel):
     name: str
     reason: str
     match_score: int = Field(ge=0, le=100)
     notes: Optional[str] = None
 
+
+class UsedProfile(BaseModel):
+    likes: List[str] = Field(default_factory=list)
+    dislikes: List[str] = Field(default_factory=list)
+    owned: List[str] = Field(default_factory=list)
+    wishlist: List[str] = Field(default_factory=list)
+
+
 class RecommendResponse(BaseModel):
-    items: List[Recommendation]
-    used_profile: PreferencePayload
-    request_id: str
+    items: List[RecommendItem]
+    used_profile: UsedProfile
+    request_id: Optional[str] = None
 
-class AnalyzeRequest(BaseModel):
-    uid: Optional[str] = None
-    prefs: Optional[PreferencePayload] = None
-    max_tags: int = Field(default=6, ge=3, le=12)
 
-class AnalyzeResponse(BaseModel):
-    summary: str
-    dominant_notes: List[str] = Field(default_factory=list)
-    style_tags: List[str] = Field(default_factory=list)
-    occasions: List[str] = Field(default_factory=list)
+class HealthResponse(BaseModel):
+    ok: bool
+    status: str
+    version: str
+    model: str
 
-# ---------- Health ----------
-@app.get("/health")
-async def health():
-    return {"ok": True, "status": "healthy", "version": APP_VERSION, "model": OPENAI_MODEL}
 
-# ---------- Helpers ----------
-def _merge_lists(a, b):
-    out, seen = [], set()
-    for lst in (a or []), (b or []):
-        for x in lst:
-            k = x.strip().lower()
-            if k and k not in seen:
-                seen.add(k); out.append(x.strip())
-    return out
+BACKEND_VERSION = "1.8.0-scentfeed-occasion-aware"
 
-def load_user_prefs(uid: Optional[str], fallback: Optional[PreferencePayload]) -> PreferencePayload:
-    likes, dislikes, owned, wishlist = [], [], [], []
-    if FIRESTORE_READY and db and uid:
-        try:
-            doc = db.collection("users").document(uid).get()
-            if doc.exists:
-                d = doc.to_dict() or {}
-                likes = _merge_lists(likes, d.get("likes", []))
-                dislikes = _merge_lists(dislikes, d.get("dislikes", []))
-                owned = _merge_lists(owned, d.get("owned", []))
-                wishlist = _merge_lists(wishlist, d.get("wishlist", []))
-            pref_doc = db.collection("users").document(uid).collection("preferences").document("default").get()
-            if pref_doc.exists:
-                d2 = pref_doc.to_dict() or {}
-                likes = _merge_lists(likes, d2.get("likes", []))
-                dislikes = _merge_lists(dislikes, d2.get("dislikes", []))
-                owned = _merge_lists(owned, d2.get("owned", []))
-                wishlist = _merge_lists(wishlist, d2.get("wishlist", []))
-        except Exception as e:
-            logging.warning("Firestore read failed: %s", e)
-    if fallback:
-        likes = _merge_lists(likes, fallback.likes)
-        dislikes = _merge_lists(dislikes, fallback.dislikes)
-        owned = _merge_lists(owned, fallback.owned)
-        wishlist = _merge_lists(wishlist, fallback.wishlist)
-    return PreferencePayload(likes=likes, dislikes=dislikes, owned=owned, wishlist=wishlist)
 
-def _validate_filters(f: Optional[FilterPayload]) -> None:
-    if not f: return
-    if f.price_min is not None and f.price_max is not None and f.price_min > f.price_max:
-        raise HTTPException(status_code=422, detail="price_min cannot be greater than price_max.")
+# ---------- Utility helpers ----------
 
-# ---------- LLM Tools ----------
-TOOL_SCHEMA_RECOMMEND = [
-    {
-        "type": "function",
-        "function": {
-            "name": "propose_recommendations",
-            "description": "Return 3–5 fragrance recommendations tailored to the user's taste and filters.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "reason": {"type": "string"},
-                                "match_score": {"type": "integer"},
-                                "notes": {"type": "string"}
-                            },
-                            "required": ["name", "reason", "match_score"]
-                        }
-                    }
-                },
-                "required": ["items"]
-            }
-        }
-    }
-]
+def trimmed_or_none(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    v = value.strip()
+    return v or None
 
-SYSTEM_PROMPT_RECOMMEND = """You are ScentFeed's fragrance AI.
 
-Hard requirements:
-- Obey all user filters strictly (price range, niche/designer, stores, houses, region, season, occasion, concentration, projection, longevity, gender_positioning). If a filter is set, every item MUST satisfy it.
-- Avoid recommending already-owned items unless explicitly justified as a variant or flankers.
-- If the prompt mentions notes (e.g., 'vanilla, oud'), include those terms in each item's reason.
-
-Output:
-- 3 items (max 5), match_score 0–100, short notes if helpful.
-- Use the 'propose_recommendations' tool to return structured JSON.
-"""
-
-def _filters_summary(f: Optional[FilterPayload]) -> str:
-    if not f: return "Filters: —"
-    def j(a): return ", ".join(a) if a else "—"
+def build_system_prompt() -> str:
+    """
+    System prompt that teaches the model how to behave:
+    - occasion-aware (Eid, Christmas, office, first date, wedding, etc)
+    - region-aware when the user mentions a country or city (e.g. Pakistan)
+    - always returns STRICT JSON, no extra text.
+    """
     return (
-        "Filters:\n"
-        f"- price_min: {f.price_min if f.price_min is not None else '—'}\n"
-        f"- price_max: {f.price_max if f.price_max is not None else '—'}\n"
-        f"- stores: {j(f.stores)}\n"
-        f"- houses: {j(f.houses)}\n"
-        f"- niche: {f.niche if f.niche is not None else '—'}\n"
-        f"- concentration: {f.concentration or '—'}\n"
-        f"- season: {f.season or '—'}\n"
-        f"- occasion: {f.occasion or '—'}\n"
-        f"- projection: {f.projection or '—'}\n"
-        f"- longevity: {f.longevity or '—'}\n"
-        f"- region: {f.region or '—'}\n"
-        f"- gender_positioning: {f.gender_positioning or '—'}"
+        "You are ScentFeed, a professional perfume recommendation engine.\n"
+        "\n"
+        "Your job:\n"
+        " - Read the user's natural language GOAL (their vibe / use case).\n"
+        " - Look at their PROFILE (likes / dislikes / owned / wishlist).\n"
+        " - Optionally look at FILTERS (region, gender, etc.).\n"
+        " - Return 3–5 perfumes that best match.\n"
+        "\n"
+        "Occasion handling examples:\n"
+        " - \"oud for Eid\" → prefer rich, elegant ouds that feel festive and respectful.\n"
+        " - \"vanilla for Christmas\" → cozy, warm, gourmand vanillas that fit winter and holidays.\n"
+        " - \"office safe\" → clean, non-offensive, moderate projection.\n"
+        " - \"gym\" → very fresh, light, not cloying.\n"
+        " - \"wedding\" → special, elegant, long-lasting.\n"
+        "\n"
+        "Region handling examples:\n"
+        " - If the goal mentions a region or country (e.g. Pakistan, India, Gulf, Middle East), "
+        "   you should *bias* toward:\n"
+        "   - popular houses or styles in that region,\n"
+        "   - scents that are realistically available there or culturally aligned.\n"
+        " - If you don't know strong local brands, you *may* still use designer / niche "
+        "   houses, but try to choose ones that are reasonably findable online from that region.\n"
+        "\n"
+        "Profile handling:\n"
+        " - If the user likes vanilla/amber/oud, prefer fragrances where those notes are central.\n"
+        " - If they dislike something (e.g. strong citrus or heavy incense), avoid those notes.\n"
+        " - Don't repeat things they already own unless the goal explicitly suggests flanker ideas.\n"
+        "\n"
+        "VERY IMPORTANT RESPONSE FORMAT:\n"
+        " - You MUST answer with ONLY valid, minified JSON.\n"
+        " - No markdown, no prose outside JSON.\n"
+        " - It MUST match this schema exactly:\n"
+        "   {\n"
+        "     \"items\": [\n"
+        "       {\n"
+        "         \"name\": \"...\",\n"
+        "         \"reason\": \"...\",\n"
+        "         \"match_score\": 0-100,\n"
+        "         \"notes\": \"optional, short comma-separated key notes\" or null\n"
+        "       },\n"
+        "       ...\n"
+        "     ],\n"
+        "     \"used_profile\": {\n"
+        "       \"likes\": [...],\n"
+        "       \"dislikes\": [...],\n"
+        "       \"owned\": [...],\n"
+        "       \"wishlist\": [...]\n"
+        "     },\n"
+        "     \"request_id\": \"string-id-for-debugging\"\n"
+        "   }\n"
+        "\n"
+        "If the goal is unclear or impossible, still return the JSON structure, but with an empty\n"
+        "\"items\" array and a short explanation in one dummy item if needed.\n"
+        "Never include trailing commas. Never include comments. Only valid JSON."
     )
 
-def build_user_prompt(goal: str, prefs: PreferencePayload, filters: Optional[FilterPayload]) -> str:
-    return f"""
-Goal: {goal}
 
-Likes: {', '.join(prefs.likes) or '—'}
-Dislikes: {', '.join(prefs.dislikes) or '—'}
-Owned: {', '.join(prefs.owned) or '—'}
-Wishlist: {', '.join(prefs.wishlist) or '—'}
+def build_user_prompt(req: RecommendRequest) -> str:
+    """
+    Convert the incoming request into a single structured user message
+    the model can reason over.
+    """
+    parts: List[str] = []
 
-{_filters_summary(filters)}
+    parts.append(f"GOAL: {req.goal.strip()}")
 
-Rules:
-- Return exactly 3 recommendations unless the user asked for a different count.
-- Each reason must explicitly reference how the item satisfies the set filters.
-""".strip()
+    # Profile
+    prefs = req.prefs
+    parts.append(
+        "PROFILE:\n"
+        f"  likes: {prefs.likes}\n"
+        f"  dislikes: {prefs.dislikes}\n"
+        f"  owned: {prefs.owned}\n"
+        f"  wishlist: {prefs.wishlist}"
+    )
 
-async def call_openai(goal: str, prefs: PreferencePayload, filters: Optional[FilterPayload], max_results: int) -> RecommendResponse:
-    _validate_filters(filters)
-    def _msgs():
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT_RECOMMEND},
-            {"role": "user", "content": build_user_prompt(goal, prefs, filters)}
-        ]
-    # up to 2 tries to enforce strict filters
-    for _ in range(2):
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=_msgs(),
-            tools=TOOL_SCHEMA_RECOMMEND,
-            tool_choice={"type": "function", "function": {"name": "propose_recommendations"}},
+    # Filters (if any)
+    if req.filters:
+        filters = req.filters
+        parts.append(
+            "FILTERS:\n"
+            f"  gender: {filters.gender}\n"
+            f"  region: {filters.region}\n"
+            f"  price_band: {filters.price_band}\n"
+            f"  raw: {filters.raw}"
         )
-        choice = resp.choices[0]
-        if not choice.message.tool_calls:
-            continue
-        args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-        raw = args.get("items", [])[:max_results]
-        items = []
-        for it in raw:
-            name = (it.get("name") or "").strip()
-            reason = (it.get("reason") or "").strip()
-            score = int(it.get("match_score", 0))
-            notes = ((it.get("notes") or "").strip() or None)
-            if name:
-                items.append(Recommendation(name=name, reason=reason, match_score=score, notes=notes))
-        if items:
-            rid = resp.id or f"req_{int(time.time()*1000)}"
-            return RecommendResponse(items=items, used_profile=prefs, request_id=rid)
-    raise HTTPException(status_code=422, detail="The model could not satisfy the filters. Try relaxing constraints.")
 
-# ---------- ANALYZE ----------
-TOOL_SCHEMA_ANALYZE = [
-    {
-        "type": "function",
-        "function": {
-            "name": "propose_profile",
-            "description": "Summarize the user's fragrance taste from likes/dislikes/owned/wishlist.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                    "dominant_notes": {"type": "array", "items": {"type": "string"}},
-                    "style_tags": {"type": "array", "items": {"type": "string"}},
-                    "occasions": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["summary","dominant_notes","style_tags","occasions"]
-            }
-        }
-    }
-]
+    parts.append(f"MAX_RESULTS: {req.max_results}")
 
-ANALYZE_SYSTEM_PROMPT = """You are ScentFeed's taste analyst.
-- Read likes, dislikes, owned, wishlist.
-- Infer concise preferences; be specific and helpful.
-- Return via the propose_profile tool.
-"""
+    return "\n\n".join(parts)
 
-async def call_openai_analyze(prefs: PreferencePayload, max_tags: int) -> AnalyzeResponse:
-    user_msg = f"""
-Likes: {', '.join(prefs.likes) or '—'}
-Dislikes: {', '.join(prefs.dislikes) or '—'}
-Owned: {', '.join(prefs.owned) or '—'}
-Wishlist: {', '.join(prefs.wishlist) or '—'}
 
-Rules:
-- 2–4 sentence summary.
-- <= {max_tags} for each of dominant_notes, style_tags, occasions.
-""".strip()
-    resp = oai.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0.4,
-        messages=[{"role":"system","content":ANALYZE_SYSTEM_PROMPT},{"role":"user","content":user_msg}],
-        tools=TOOL_SCHEMA_ANALYZE,
-        tool_choice={"type":"function","function":{"name":"propose_profile"}}
-    )
-    choice = resp.choices[0]
-    if not choice.message.tool_calls:
-        raise HTTPException(status_code=503, detail="AI analyze failed.")
-    args = json.loads(choice.message.tool_calls[0].function.arguments or "{}")
-    return AnalyzeResponse(
-        summary = str(args.get("summary","")).strip() or "Here’s your taste profile.",
-        dominant_notes = [str(x).strip() for x in args.get("dominant_notes", [])][:max_tags],
-        style_tags = [str(x).strip() for x in args.get("style_tags", [])][:max_tags],
-        occasions = [str(x).strip() for x in args.get("occasions", [])][:max_tags],
+# ---------- Routes ----------
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(
+        ok=True,
+        status="healthy",
+        version=BACKEND_VERSION,
+        model="gpt-4o-mini",
     )
 
-# ---------- Endpoints ----------
+
 @app.post("/recommend", response_model=RecommendResponse)
-async def recommend(req: RecommendRequest):
-    profile = load_user_prefs(req.uid, req.prefs)
-    return await call_openai(req.goal, profile, req.filters, req.max_results)
+async def recommend(req: RecommendRequest) -> RecommendResponse:
+    """
+    Main recommendation endpoint called by the iOS app.
+    """
+    goal = trimmed_or_none(req.goal)
+    if not goal:
+        raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest):
-    profile = load_user_prefs(req.uid, req.prefs)
-    return await call_openai_analyze(profile, req.max_tags)
+    system_prompt = build_system_prompt()
+    user_prompt = build_user_prompt(req)
+
+    try:
+        started = time.time()
+
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.7,
+            max_tokens=900,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        latency_ms = int((time.time() - started) * 1000)
+        choice = completion.choices[0]
+        raw_json = choice.message.content
+
+        # Debug log (shortened)
+        print(f"🌐 /recommend status: 200, latency={latency_ms}ms")
+        # If you want, you can log raw_json here in DEBUG only.
+
+        # Parse JSON into our Pydantic model
+        try:
+            # raw_json is a JSON string; Pydantic can parse from dict
+            import json
+
+            data = json.loads(raw_json)
+        except Exception as e:
+            print(f"❗️/recommend decode failed. Raw body: {raw_json}")
+            raise HTTPException(status_code=502, detail=f"Failed to decode model JSON: {e}")
+
+        # Fill in used_profile defaults if the model omits anything
+        used_profile = data.get("used_profile") or {}
+        used_profile_obj = UsedProfile(
+            likes=used_profile.get("likes") or req.prefs.likes,
+            dislikes=used_profile.get("dislikes") or req.prefs.dislikes,
+            owned=used_profile.get("owned") or req.prefs.owned,
+            wishlist=used_profile.get("wishlist") or req.prefs.wishlist,
+        )
+
+        # Build response
+        items_data = data.get("items") or []
+        items: List[RecommendItem] = []
+        for item in items_data:
+            # Defensive parsing
+            name = item.get("name") or "Unknown fragrance"
+            reason = item.get("reason") or "No reason provided."
+            match_score = item.get("match_score") or 75
+            notes = item.get("notes")
+            items.append(
+                RecommendItem(
+                    name=name,
+                    reason=reason,
+                    match_score=int(match_score),
+                    notes=notes,
+                )
+            )
+
+        request_id = data.get("request_id") or completion.id
+
+        return RecommendResponse(
+            items=items,
+            used_profile=used_profile_obj,
+            request_id=request_id,
+        )
+
+    except HTTPException:
+        # Re-raise any explicit HTTP errors
+        raise
+    except Exception as e:
+        print("❌ /recommend unexpected error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
 
 
