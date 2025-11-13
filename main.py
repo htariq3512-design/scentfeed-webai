@@ -1,5 +1,5 @@
 # main.py
-# ScentFeed — Web AI (Recommend + Analyze)
+# ScentFeed — Web AI (Recommend + Analyz)
 # Billion-dollar version: strict INTENT enforcement, deterministic fallbacks, safe Firestore merge, clean retries.
 
 import os
