@@ -108,7 +108,7 @@ class PerfumeCatalogItem(BaseModel):
         notes = ", ".join(self.all_notes) if self.all_notes else ""
         tags = ", ".join(self.tags) if self.tags else ""
         proj = self.projection or "unknown"
-        long = self.longevity or "unknown"
+        long_ = self.longevity or "unknown"
 
         parts = [
             f"{self.name} by {brand}",
@@ -119,7 +119,7 @@ class PerfumeCatalogItem(BaseModel):
         if tags:
             parts.append(f"tags: {tags}")
         parts.append(f"projection: {proj}")
-        parts.append(f"longevity: {long}")
+        parts.append(f"longevity: {long_}")
         return " | ".join(parts)
 
 
@@ -200,9 +200,9 @@ def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
     """
     Normalize price bands between frontend naming and DB values.
     Frontend might send:
-      - \"0-100\", \"100-200\", \"200+\"
-      - OR \"budget\", \"mid\", \"luxury\"
-    DB uses \"0-100\", \"100-200\", \"200+\" in price_tier.
+      - "0-100", "100-200", "200+"
+      - OR "budget", "mid", "luxury"
+    DB uses "0-100", "100-200", "200+" in price_tier.
     """
     if not filters or not filters.price_band:
         return None
@@ -371,6 +371,9 @@ def clamp_items_to_catalog_and_price(
     - Re-check price band on the Python side.
     - If something doesn't match, drop it.
     """
+    if not catalog:
+        return []
+
     # Build lookup by lowercase name
     by_name = {p.name.lower(): p for p in catalog}
     price_band = resolve_price_band(req.filters)
@@ -411,12 +414,10 @@ def clamp_items_to_catalog_and_price(
         )
 
     # If we dropped everything (model ignored catalog or price too strict),
-    # relax: ignore price band and just take the best matches we can map,
-    # or take a few top catalog entries as a last resort.
-    if not cleaned:
+    # relax: ignore price band and just take the best matches we can map.
+    if not cleaned and catalog:
         print("⚠️ clamp_items_to_catalog_and_price: no valid items after clamping, relaxing constraints.")
 
-        # First, try mapping by name ignoring price band
         by_name_all = {p.name.lower(): p for p in catalog}
         for item in items:
             raw_name = (item.get("name") or "").strip()
@@ -447,6 +448,41 @@ def clamp_items_to_catalog_and_price(
     return cleaned[:max_results]
 
 
+# ---------- Hard fallback (never return empty) ----------
+
+def build_fallback_items(req: RecommendRequest) -> List[RecommendItem]:
+    """
+    Last-resort offline recommendations if:
+    - Supabase catalog is empty, or
+    - Model returns no items, or
+    - Clamping removes everything.
+    These are not catalog-bound, but guarantee the app always shows something.
+    """
+    goal = req.goal.strip()
+    base_reason = f"Fits your request: {goal}."
+
+    return [
+        RecommendItem(
+            name="Dior Sauvage Eau de Toilette",
+            reason=base_reason + " Versatile fresh 'blue' scent that works for almost any casual or office situation.",
+            match_score=88,
+            notes="bergamot, pepper, ambroxan",
+        ),
+        RecommendItem(
+            name="Parfums de Marly Layton",
+            reason=base_reason + " Sweet, spicy and mass-appealing; great for dates and evenings with strong performance.",
+            match_score=86,
+            notes="apple, vanilla, cardamom",
+        ),
+        RecommendItem(
+            name="Chanel Bleu de Chanel Eau de Parfum",
+            reason=base_reason + " Modern, classy blue scent that feels put-together and safe in many settings.",
+            match_score=84,
+            notes="citrus, incense, woods",
+        ),
+    ]
+
+
 # ---------- Routes ----------
 
 
@@ -464,18 +500,29 @@ def health() -> HealthResponse:
 async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
-    Now catalog-aware: strictly picks from Supabase perfumes.
+    Catalog-aware when Supabase is available, with a hard-coded safety
+    fallback so you NEVER return an empty items array.
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
         raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
-    # Load catalog from Supabase
+    # Load catalog from Supabase (may be empty if not configured)
     catalog_all = load_catalog_from_supabase()
+
+    # If catalog is completely empty, skip AI and return hard fallback.
     if not catalog_all:
-        raise HTTPException(
-            status_code=500,
-            detail="Perfume catalog is empty or Supabase is not configured."
+        print("⚠️ Catalog empty or Supabase not configured — returning hard fallback recommendations.")
+        fallback_items = build_fallback_items(req)
+        return RecommendResponse(
+            items=fallback_items,
+            used_profile=UsedProfile(
+                likes=req.prefs.likes,
+                dislikes=req.prefs.dislikes,
+                owned=req.prefs.owned,
+                wishlist=req.prefs.wishlist,
+            ),
+            request_id="fallback-no-catalog",
         )
 
     catalog = filter_catalog_for_request(catalog_all, req)
@@ -507,8 +554,20 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             data = json.loads(raw_json)
         except Exception as e:
             print(f"❗️/recommend decode failed. Raw body: {raw_json}")
-            raise HTTPException(status_code=502, detail=f"Failed to decode model JSON: {e}")
+            # If the model returned garbage, use hard fallback.
+            fallback_items = build_fallback_items(req)
+            return RecommendResponse(
+                items=fallback_items,
+                used_profile=UsedProfile(
+                    likes=req.prefs.likes,
+                    dislikes=req.prefs.dislikes,
+                    owned=req.prefs.owned,
+                    wishlist=req.prefs.wishlist,
+                ),
+                request_id=f"fallback-decode-error-{completion.id}",
+            )
 
+        # Profile usage (or default to incoming prefs)
         used_profile = data.get("used_profile") or {}
         used_profile_obj = UsedProfile(
             likes=used_profile.get("likes") or req.prefs.likes,
@@ -517,10 +576,28 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             wishlist=used_profile.get("wishlist") or req.prefs.wishlist,
         )
 
+        request_id = data.get("request_id") or completion.id
+
+        # Items from the model
         items_data = data.get("items") or []
+
+        # If the model gave us no items at all, hard fallback immediately.
+        if not items_data:
+            print("⚠️ Model returned empty items — using hard fallback recommendations.")
+            fallback_items = build_fallback_items(req)
+            return RecommendResponse(
+                items=fallback_items,
+                used_profile=used_profile_obj,
+                request_id=request_id,
+            )
+
+        # Clamp to catalog + price band
         cleaned_items = clamp_items_to_catalog_and_price(items_data, catalog, req)
 
-        request_id = data.get("request_id") or completion.id
+        # If clamping removed everything, hard fallback.
+        if not cleaned_items:
+            print("⚠️ No items remained after clamping — using hard fallback recommendations.")
+            cleaned_items = build_fallback_items(req)
 
         return RecommendResponse(
             items=cleaned_items,
@@ -532,6 +609,18 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         raise
     except Exception as e:
         print("❌ /recommend unexpected error:", repr(e))
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+        # On unexpected error, also try hard fallback instead of pure 500.
+        fallback_items = build_fallback_items(req)
+        return RecommendResponse(
+            items=fallback_items,
+            used_profile=UsedProfile(
+                likes=req.prefs.likes,
+                dislikes=req.prefs.dislikes,
+                owned=req.prefs.owned,
+                wishlist=req.prefs.wishlist,
+            ),
+            request_id="fallback-internal-error",
+        )
+
 
 
