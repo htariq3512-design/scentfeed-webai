@@ -1,11 +1,9 @@
 #
-# ScentFeed Web AI backend – simple, online-only, price-aware (NO Supabase)
-#
-# - Uses OpenAI only (no DB / catalog)
-# - Takes: GOAL + PROFILE + FILTERS (including price_band)
-# - Teaches the model about rough price brackets and brand tiers
-# - Strongly discourages always returning the same 2–3 perfumes
-# - Always returns at least some items via a generic fallback
+# Simple ScentFeed Web AI backend WITH LOGGING:
+# - NO Supabase catalog enforcement for now (pure model suggestions)
+# - Uses OpenAI to generate 1–N recommendations
+# - Always returns items (falls back to a default trio if the model fails)
+# - LOGS every recommendation into Supabase recommend_events table
 #
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -15,6 +13,7 @@ import time
 import json
 
 from openai import OpenAI
+import requests
 
 # ---------- OpenAI client ----------
 
@@ -22,7 +21,7 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ---------- FastAPI app ----------
 
-app = FastAPI(title="ScentFeed Web AI", version="3.1.0-simple-price-aware")
+app = FastAPI(title="ScentFeed Web AI", version="3.1.0-simple-online-logged")
 
 # ---------- Pydantic models (wire contract with the iOS app) ----------
 
@@ -80,7 +79,81 @@ class HealthResponse(BaseModel):
     model: str
 
 
-BACKEND_VERSION = "3.1.0-simple-price-aware"
+BACKEND_VERSION = "3.1.0-simple-online-logged"
+
+# ---------- Supabase logging config ----------
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    print("⚠️ Supabase logging disabled – missing SUPABASE_URL or SERVICE/ANON KEY.")
+else:
+    print(f"✅ Supabase logging enabled -> {SUPABASE_URL}/rest/v1/recommend_events")
+
+SUPABASE_LOG_URL = SUPABASE_URL + "/rest/v1/recommend_events"
+
+
+def log_recommend_event(
+    uid: Optional[str],
+    goal: str,
+    price_band: Optional[str],
+    prefs: Prefs,
+    items: List[RecommendItem],
+    source: str,
+    request_id: Optional[str],
+) -> None:
+    """
+    Send recommendation logs to Supabase recommend_events table.
+
+    Expected columns in recommend_events:
+      - uid (text)
+      - goal (text)
+      - price_band (text)
+      - likes (jsonb)
+      - dislikes (jsonb)
+      - owned (jsonb)
+      - wishlist (jsonb)
+      - items (jsonb)
+      - source (text)  -- e.g. "online-openai" or "fallback"
+      - request_id (text)
+      - created_at (timestamptz, default now())
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        # Logging disabled
+        return
+
+    payload = {
+        "uid": uid or "unknown",
+        "goal": goal,
+        "price_band": price_band,
+        "likes": prefs.likes,
+        "dislikes": prefs.dislikes,
+        "owned": prefs.owned,
+        "wishlist": prefs.wishlist,
+        "items": [item.dict() for item in items],
+        "source": source,
+        "request_id": request_id,
+    }
+
+    try:
+        resp = requests.post(
+            SUPABASE_LOG_URL,
+            json=payload,
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            timeout=5,
+        )
+        if resp.status_code >= 300:
+            print(f"❗️ Supabase log failed: {resp.status_code} {resp.text}")
+        else:
+            print("📡 Supabase log stored.")
+    except Exception as e:
+        print("❌ Supabase log error:", repr(e))
 
 
 # ---------- Utility helpers ----------
@@ -92,36 +165,11 @@ def trimmed_or_none(value: Optional[str]) -> Optional[str]:
     return v or None
 
 
-def normalize_price_band(pb: Optional[str]) -> Optional[str]:
-    """
-    Normalize price band hints from frontend to one of:
-    - "0-100", "100-200", "200+"
-    or None.
-    """
-    if not pb:
-        return None
-    s = pb.strip().lower()
-    if s in ("0-100", "0 – 100", "0 — 100", "0_to_100", "0_100", "0 –100"):
-        return "0-100"
-    if s in ("100-200", "100 – 200", "100 — 200", "100_to_200", "100_200"):
-        return "100-200"
-    if s in ("200+", "200_plus", "200 – up", "200+ "):
-        return "200+"
-    if s in ("budget", "$", "low"):
-        return "0-100"
-    if s in ("mid", "$$", "medium"):
-        return "100-200"
-    if s in ("luxury", "$$$", "high", "premium"):
-        return "200+"
-    return None
-
-
 def build_system_prompt() -> str:
     """
     System prompt that teaches the model how to behave:
     - Good perfume recommender
     - Occasion-aware, budget-aware
-    - Knows rough price tiers for big brands
     - STRICT JSON
     """
     return (
@@ -134,31 +182,18 @@ def build_system_prompt() -> str:
         "\n"
         "Your job:\n"
         " - Suggest realistic perfumes that match the GOAL and PROFILE.\n"
-        " - Use your knowledge of real perfume prices and brand tiers.\n"
-        " - Respect price_band as much as possible:\n"
-        "     * '0-100' → mostly designer, affordable lines, Zara, Bath & Body Works,\n"
-        "       The Body Shop, Abercrombie, Montblanc, Nautica, etc. Avoid ultra-luxury niche.\n"
-        "     * '100-200' → many designer EDPs and some entry niche. Mix of popular brands.\n"
-        "     * '200+' → luxury & niche houses (Creed, Maison Francis Kurkdjian,\n"
-        "       Parfums de Marly, Tom Ford Private Blend, Xerjoff, Roja, Armani Privé, Louis Vuitton, etc.).\n"
-        " - For '0-100', you should NOT recommend ultra-luxury niche houses like Creed,\n"
-        "   Parfums de Marly, MFK, Xerjoff, Roja, Tom Ford Private Blend, Louis Vuitton,\n"
-        "   Armani Privé, etc. These belong more naturally in '200+' budgets.\n"
-        " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward notes and styles that match.\n"
+        " - Respect price_band as much as possible.\n"
+        " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward those notes.\n"
         " - If PROFILE shows dislikes, avoid those.\n"
         " - Avoid recommending things the user already OWNS unless there are not enough new options.\n"
-        "\n"
-        "Diversity rule:\n"
-        " - When the GOAL clearly changes (vibe, setting, budget), do NOT always return\n"
-        "   the same 2–3 perfumes. Prefer to vary the suggestions so different\n"
-        "   scenarios feel different for the user.\n"
+        " - If the GOAL clearly changes (different vibe, setting, budget), you should explore different perfumes.\n"
         "\n"
         "Occasion examples:\n"
-        " - 'oud for Eid' → prefer rich, elegant ouds that feel festive and respectful.\n"
-        " - 'vanilla for Christmas' → cozy, warm, gourmand vanillas that fit winter and holidays.\n"
-        " - 'office safe' → clean, non-offensive, moderate projection.\n"
-        " - 'gym' → very fresh, light, not cloying.\n"
-        " - 'wedding' → special, elegant, long-lasting.\n"
+        " - \"oud for Eid\" → prefer rich, elegant ouds that feel festive and respectful.\n"
+        " - \"vanilla for Christmas\" → cozy, warm, gourmand vanillas that fit winter and holidays.\n"
+        " - \"office safe\" → clean, non-offensive, moderate projection.\n"
+        " - \"gym\" → very fresh, light, not cloying.\n"
+        " - \"wedding\" → special, elegant, long-lasting.\n"
         "\n"
         "VERY IMPORTANT RESPONSE FORMAT:\n"
         " - You MUST answer with ONLY valid, minified JSON.\n"
@@ -190,7 +225,7 @@ def build_system_prompt() -> str:
 def build_user_prompt(req: RecommendRequest) -> str:
     """
     Convert the incoming request into a structured user message.
-    No DB catalog – just GOAL + PROFILE + FILTERS + price hints.
+    No catalog now – just GOAL + PROFILE + FILTERS.
     """
     parts: List[str] = []
 
@@ -208,16 +243,16 @@ def build_user_prompt(req: RecommendRequest) -> str:
 
     # Filters (if any)
     if req.filters:
-        norm_price = normalize_price_band(req.filters.price_band)
+        f = req.filters
         parts.append(
             "FILTERS:\n"
-            f"  gender: {req.filters.gender}\n"
-            f"  region: {req.filters.region}\n"
-            f"  price_band_normalized: {norm_price}\n"
-            f"  raw: {req.filters.raw}"
+            f"  gender: {f.gender}\n"
+            f"  region: {f.region}\n"
+            f"  price_band: {f.price_band}\n"
+            f"  raw: {f.raw}"
         )
     else:
-        parts.append("FILTERS:\n  gender: null\n  region: null\n  price_band_normalized: null\n  raw: null")
+        parts.append("FILTERS:\n  gender: null\n  region: null\n  price_band: null\n  raw: null")
 
     parts.append(f"MAX_RESULTS: {req.max_results}")
 
@@ -244,14 +279,14 @@ def build_fallback_items(goal: str) -> List[RecommendItem]:
             notes="bergamot, pepper, ambroxan",
         ),
         RecommendItem(
-            name="Yves Saint Laurent Y Eau de Parfum",
-            reason=base_reason + " Modern, fresh and slightly sweet, great for daily wear and evenings.",
+            name="Parfums de Marly Layton",
+            reason=base_reason + " Sweet, spicy and mass-appealing; great for dates and evenings with strong performance.",
             match_score=86,
-            notes="apple, ginger, amber woods",
+            notes="apple, vanilla, cardamom",
         ),
         RecommendItem(
             name="Chanel Bleu de Chanel Eau de Parfum",
-            reason=base_reason + " Classy blue scent that feels put-together and safe in many settings.",
+            reason=base_reason + " Modern, classy blue scent that feels put-together and safe in many settings.",
             match_score=84,
             notes="citrus, incense, woods",
         ),
@@ -276,9 +311,9 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     Simple online-only version:
-    - No Supabase / DB
-    - Just OpenAI + price-band-aware instructions
-    - Always falls back to some reasonable designer choices
+    - No Supabase / DB lookups
+    - Just OpenAI + safety fallback
+    - Logs EVERY call to Supabase recommend_events
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
@@ -287,12 +322,15 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(req)
 
+    # Snapshot price_band string once (for logging)
+    price_band = req.filters.price_band if req.filters else None
+
     try:
         started = time.time()
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.7,  # a bit higher to encourage variety
+            temperature=0.6,
             max_tokens=900,
             response_format={"type": "json_object"},
             messages=[
@@ -313,6 +351,18 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         except Exception as e:
             print(f"❗️/recommend decode failed. Raw body: {raw_json}")
             fallback_items = build_fallback_items(goal)
+
+            # LOG fallback
+            log_recommend_event(
+                uid=req.uid,
+                goal=goal,
+                price_band=price_band,
+                prefs=req.prefs,
+                items=fallback_items,
+                source="fallback-decode-error",
+                request_id=f"fallback-decode-error-{completion.id}",
+            )
+
             return RecommendResponse(
                 items=fallback_items,
                 used_profile=UsedProfile(
@@ -360,11 +410,25 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             )
 
         # If the model gave us no usable items, use fallback.
+        source = "online-openai"
+        request_id = data.get("request_id") or completion.id
+
         if not items:
             print("⚠️ Model returned empty/invalid items — using hard fallback recommendations.")
             items = build_fallback_items(goal)
+            source = "fallback-empty-model"
+            request_id = f"{request_id}-fallback-empty"
 
-        request_id = data.get("request_id") or completion.id
+        # LOG FINAL ITEMS
+        log_recommend_event(
+            uid=req.uid,
+            goal=goal,
+            price_band=price_band,
+            prefs=req.prefs,
+            items=items,
+            source=source,
+            request_id=request_id,
+        )
 
         return RecommendResponse(
             items=items,
@@ -378,6 +442,18 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         print("❌ /recommend unexpected error:", repr(e))
         # On unexpected error, also try hard fallback instead of pure 500.
         fallback_items = build_fallback_items(goal)
+
+        # LOG fallback
+        log_recommend_event(
+            uid=req.uid,
+            goal=goal,
+            price_band=price_band,
+            prefs=req.prefs,
+            items=fallback_items,
+            source="fallback-internal-error",
+            request_id="fallback-internal-error",
+        )
+
         return RecommendResponse(
             items=fallback_items,
             used_profile=UsedProfile(
