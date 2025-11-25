@@ -369,21 +369,27 @@ def clamp_items_to_catalog_and_price(
     """
     - Ensure every item actually exists in the catalog.
     - Re-check price band on the Python side.
-    - If something doesn't match, drop it.
+    - If items don't match or are empty, fall back to REAL catalog-based suggestions.
     """
     if not catalog:
         return []
 
-    # Build lookup by lowercase name
-    by_name = {p.name.lower(): p for p in catalog}
+    # Helper to normalize names for matching
+    def normalize_name(s: str) -> str:
+        return "".join(c.lower() for c in s.strip() if c.isalnum() or c.isspace())
+
+    by_name = {normalize_name(p.name): p for p in catalog}
     price_band = resolve_price_band(req.filters)
 
     cleaned: List[RecommendItem] = []
+
+    # First pass: try to use the model's items and map them to catalog
     for item in items:
         raw_name = (item.get("name") or "").strip()
         if not raw_name:
             continue
-        key = raw_name.lower()
+
+        key = normalize_name(raw_name)
         perfume = by_name.get(key)
         if not perfume:
             # Model tried to hallucinate or spelling mismatch; drop it
@@ -413,32 +419,26 @@ def clamp_items_to_catalog_and_price(
             )
         )
 
-    # If we dropped everything (model ignored catalog or price too strict),
-    # relax: ignore price band and just take the best matches we can map.
-    if not cleaned and catalog:
-        print("⚠️ clamp_items_to_catalog_and_price: no valid items after clamping, relaxing constraints.")
+    # If we dropped everything (or items was empty), build fallback from catalog
+    if not cleaned:
+        print("⚠️ clamp_items_to_catalog_and_price: no valid items after clamping, using catalog-based fallback.")
 
-        by_name_all = {p.name.lower(): p for p in catalog}
-        for item in items:
-            raw_name = (item.get("name") or "").strip()
-            if not raw_name:
-                continue
-            key = raw_name.lower()
-            perfume = by_name_all.get(key)
-            if not perfume:
-                continue
-            reason = item.get("reason") or "No reason provided."
-            match_score = item.get("match_score") or 75
-            notes = item.get("notes")
-            try:
-                match_score_int = int(match_score)
-            except Exception:
-                match_score_int = 75
+        # Use the same coarse filters as before (mainly price band).
+        fallback_catalog = filter_catalog_for_request(catalog, req)
+        if not fallback_catalog:
+            fallback_catalog = catalog
+
+        max_results = max(1, req.max_results)
+        for perfume in fallback_catalog[:max_results]:
+            # Build a short notes summary from catalog data
+            note_list = perfume.all_notes
+            notes = ", ".join(note_list[:6]) if note_list else None
+
             cleaned.append(
                 RecommendItem(
                     name=perfume.name,
-                    reason=reason,
-                    match_score=max(0, min(100, match_score_int)),
+                    reason=f"Fits your goal \"{req.goal}\" based on catalog notes, style and price band.",
+                    match_score=80,
                     notes=notes,
                 )
             )
@@ -448,15 +448,14 @@ def clamp_items_to_catalog_and_price(
     return cleaned[:max_results]
 
 
-# ---------- Hard fallback (never return empty) ----------
+# ---------- Hard fallback (only when catalog is unavailable / fatal errors) ----------
 
 def build_fallback_items(req: RecommendRequest) -> List[RecommendItem]:
     """
     Last-resort offline recommendations if:
-    - Supabase catalog is empty, or
-    - Model returns no items, or
-    - Clamping removes everything.
-    These are not catalog-bound, but guarantee the app always shows something.
+    - Supabase catalog is empty / not configured, or
+    - A fatal internal error occurs before we can use the catalog.
+    These are NOT catalog-bound; they are just to avoid returning an empty list.
     """
     goal = req.goal.strip()
     base_reason = f"Fits your request: {goal}."
@@ -501,7 +500,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     Catalog-aware when Supabase is available, with a hard-coded safety
-    fallback so you NEVER return an empty items array.
+    fallback only when the catalog is unavailable or on fatal errors.
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
@@ -554,10 +553,10 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             data = json.loads(raw_json)
         except Exception as e:
             print(f"❗️/recommend decode failed. Raw body: {raw_json}")
-            # If the model returned garbage, use hard fallback.
-            fallback_items = build_fallback_items(req)
+            # If the model returned garbage, use catalog-based fallback.
+            cleaned_items = clamp_items_to_catalog_and_price([], catalog, req)
             return RecommendResponse(
-                items=fallback_items,
+                items=cleaned_items,
                 used_profile=UsedProfile(
                     likes=req.prefs.likes,
                     dislikes=req.prefs.dislikes,
@@ -578,26 +577,11 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
 
         request_id = data.get("request_id") or completion.id
 
-        # Items from the model
+        # Items from the model (may be empty)
         items_data = data.get("items") or []
 
-        # If the model gave us no items at all, hard fallback immediately.
-        if not items_data:
-            print("⚠️ Model returned empty items — using hard fallback recommendations.")
-            fallback_items = build_fallback_items(req)
-            return RecommendResponse(
-                items=fallback_items,
-                used_profile=used_profile_obj,
-                request_id=request_id,
-            )
-
-        # Clamp to catalog + price band
+        # Clamp to catalog + price band (with internal catalog-based fallback)
         cleaned_items = clamp_items_to_catalog_and_price(items_data, catalog, req)
-
-        # If clamping removed everything, hard fallback.
-        if not cleaned_items:
-            print("⚠️ No items remained after clamping — using hard fallback recommendations.")
-            cleaned_items = build_fallback_items(req)
 
         return RecommendResponse(
             items=cleaned_items,
@@ -609,7 +593,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         raise
     except Exception as e:
         print("❌ /recommend unexpected error:", repr(e))
-        # On unexpected error, also try hard fallback instead of pure 500.
+        # On unexpected error, use hard fallback (catalog might be unusable here).
         fallback_items = build_fallback_items(req)
         return RecommendResponse(
             items=fallback_items,
@@ -621,6 +605,5 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             ),
             request_id="fallback-internal-error",
         )
-
 
 
