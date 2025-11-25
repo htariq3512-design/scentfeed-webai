@@ -1,10 +1,11 @@
 #
-# Simple ScentFeed Web AI backend WITH LOGGING:
-# - NO Supabase catalog enforcement for now (pure model suggestions)
+# Simple ScentFeed Web AI backend:
+# - NO Supabase catalog / clamping for now
 # - Uses OpenAI to generate 1–N recommendations
 # - Always returns items (falls back to a default trio if the model fails)
-# - LOGS every recommendation into Supabase recommend_events table
+# - Logs every call into Supabase.recommendation_logs (fire-and-forget)
 #
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -12,8 +13,8 @@ import os
 import time
 import json
 
-from openai import OpenAI
 import requests
+from openai import OpenAI
 
 # ---------- OpenAI client ----------
 
@@ -81,79 +82,56 @@ class HealthResponse(BaseModel):
 
 BACKEND_VERSION = "3.1.0-simple-online-logged"
 
-# ---------- Supabase logging config ----------
+# ---------- Supabase logging ----------
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    print("⚠️ Supabase logging disabled – missing SUPABASE_URL or SERVICE/ANON KEY.")
-else:
-    print(f"✅ Supabase logging enabled -> {SUPABASE_URL}/rest/v1/recommend_events")
-
-SUPABASE_LOG_URL = SUPABASE_URL + "/rest/v1/recommend_events"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
 
 
-def log_recommend_event(
-    uid: Optional[str],
-    goal: str,
-    price_band: Optional[str],
-    prefs: Prefs,
-    items: List[RecommendItem],
-    source: str,
-    request_id: Optional[str],
-) -> None:
+def log_recommendation(req: RecommendRequest, resp: RecommendResponse) -> None:
     """
-    Send recommendation logs to Supabase recommend_events table.
-
-    Expected columns in recommend_events:
-      - uid (text)
-      - goal (text)
-      - price_band (text)
-      - likes (jsonb)
-      - dislikes (jsonb)
-      - owned (jsonb)
-      - wishlist (jsonb)
-      - items (jsonb)
-      - source (text)  -- e.g. "online-openai" or "fallback"
-      - request_id (text)
+    Fire-and-forget log into Supabase.recommendation_logs.
+    If anything fails, we just print and move on – never break the API.
+    Table schema (in Supabase):
+      - id (uuid, default gen_random_uuid()) PK
       - created_at (timestamptz, default now())
+      - goal (text)
+      - max_results (int)
+      - prefs (jsonb)
+      - filters (jsonb)
+      - items (jsonb)
+      - request_id (text)
+      - client_uid (text)
     """
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        # Logging disabled
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        # Logging disabled if not configured
         return
 
-    payload = {
-        "uid": uid or "unknown",
-        "goal": goal,
-        "price_band": price_band,
-        "likes": prefs.likes,
-        "dislikes": prefs.dislikes,
-        "owned": prefs.owned,
-        "wishlist": prefs.wishlist,
-        "items": [item.dict() for item in items],
-        "source": source,
-        "request_id": request_id,
-    }
-
     try:
-        resp = requests.post(
-            SUPABASE_LOG_URL,
-            json=payload,
-            headers={
-                "apikey": SUPABASE_SERVICE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
+        url = SUPABASE_URL.rstrip("/") + "/rest/v1/recommendation_logs"
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        payload = {
+            "goal": req.goal,
+            "max_results": req.max_results,
+            "prefs": {
+                "likes": req.prefs.likes,
+                "dislikes": req.prefs.dislikes,
+                "owned": req.prefs.owned,
+                "wishlist": req.prefs.wishlist,
             },
-            timeout=5,
-        )
-        if resp.status_code >= 300:
-            print(f"❗️ Supabase log failed: {resp.status_code} {resp.text}")
-        else:
-            print("📡 Supabase log stored.")
+            "filters": req.filters.dict() if req.filters else None,
+            "items": [item.dict() for item in resp.items],
+            "request_id": resp.request_id,
+            "client_uid": req.uid,
+        }
+        requests.post(url, headers=headers, json=payload, timeout=3)
     except Exception as e:
-        print("❌ Supabase log error:", repr(e))
+        print("⚠️ log_recommendation failed:", repr(e))
 
 
 # ---------- Utility helpers ----------
@@ -182,7 +160,7 @@ def build_system_prompt() -> str:
         "\n"
         "Your job:\n"
         " - Suggest realistic perfumes that match the GOAL and PROFILE.\n"
-        " - Respect price_band as much as possible.\n"
+        " - Respect price_band as much as possible, but approximate if needed.\n"
         " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward those notes.\n"
         " - If PROFILE shows dislikes, avoid those.\n"
         " - Avoid recommending things the user already OWNS unless there are not enough new options.\n"
@@ -311,9 +289,9 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     Simple online-only version:
-    - No Supabase / DB lookups
+    - No Supabase catalog / DB filtering
     - Just OpenAI + safety fallback
-    - Logs EVERY call to Supabase recommend_events
+    - Logs each call to Supabase.recommendation_logs (if configured)
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
@@ -321,9 +299,6 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
 
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(req)
-
-    # Snapshot price_band string once (for logging)
-    price_band = req.filters.price_band if req.filters else None
 
     try:
         started = time.time()
@@ -351,19 +326,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         except Exception as e:
             print(f"❗️/recommend decode failed. Raw body: {raw_json}")
             fallback_items = build_fallback_items(goal)
-
-            # LOG fallback
-            log_recommend_event(
-                uid=req.uid,
-                goal=goal,
-                price_band=price_band,
-                prefs=req.prefs,
-                items=fallback_items,
-                source="fallback-decode-error",
-                request_id=f"fallback-decode-error-{completion.id}",
-            )
-
-            return RecommendResponse(
+            response_obj = RecommendResponse(
                 items=fallback_items,
                 used_profile=UsedProfile(
                     likes=req.prefs.likes,
@@ -373,6 +336,8 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
                 ),
                 request_id=f"fallback-decode-error-{completion.id}",
             )
+            log_recommendation(req, response_obj)
+            return response_obj
 
         # used_profile from model (or default)
         used_profile = data.get("used_profile") or {}
@@ -410,31 +375,19 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             )
 
         # If the model gave us no usable items, use fallback.
-        source = "online-openai"
-        request_id = data.get("request_id") or completion.id
-
         if not items:
             print("⚠️ Model returned empty/invalid items — using hard fallback recommendations.")
             items = build_fallback_items(goal)
-            source = "fallback-empty-model"
-            request_id = f"{request_id}-fallback-empty"
 
-        # LOG FINAL ITEMS
-        log_recommend_event(
-            uid=req.uid,
-            goal=goal,
-            price_band=price_band,
-            prefs=req.prefs,
-            items=items,
-            source=source,
-            request_id=request_id,
-        )
+        request_id = data.get("request_id") or completion.id
 
-        return RecommendResponse(
+        response_obj = RecommendResponse(
             items=items,
             used_profile=used_profile_obj,
             request_id=request_id,
         )
+        log_recommendation(req, response_obj)
+        return response_obj
 
     except HTTPException:
         raise
@@ -442,19 +395,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         print("❌ /recommend unexpected error:", repr(e))
         # On unexpected error, also try hard fallback instead of pure 500.
         fallback_items = build_fallback_items(goal)
-
-        # LOG fallback
-        log_recommend_event(
-            uid=req.uid,
-            goal=goal,
-            price_band=price_band,
-            prefs=req.prefs,
-            items=fallback_items,
-            source="fallback-internal-error",
-            request_id="fallback-internal-error",
-        )
-
-        return RecommendResponse(
+        response_obj = RecommendResponse(
             items=fallback_items,
             used_profile=UsedProfile(
                 likes=req.prefs.likes,
@@ -464,5 +405,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             ),
             request_id="fallback-internal-error",
         )
+        log_recommendation(req, response_obj)
+        return response_obj
 
 
