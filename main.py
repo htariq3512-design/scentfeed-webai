@@ -6,6 +6,7 @@ import os
 import time
 import json
 import threading
+import random
 
 import requests
 from openai import OpenAI
@@ -31,11 +32,11 @@ class Prefs(BaseModel):
 class RecommendFilters(BaseModel):
     """
     Filters coming from the app. We mainly care about price_band,
-    but we forward gender/region/tags to the model as hints.
+    but we also keep gender/region/raw for future hints.
     """
     gender: Optional[str] = None          # "male" | "female" | "unisex"
     region: Optional[str] = None          # "pakistan", "gulf", "europe", ...
-    price_band: Optional[str] = None      # "0-100", "100-200", "200+", or "budget"/"mid"/"luxury"
+    price_band: Optional[str] = None      # "0-100", "100-200", "200+"
     raw: Optional[Dict[str, Any]] = None  # any extra future stuff
 
 
@@ -168,7 +169,6 @@ def load_catalog_from_supabase() -> List[PerfumeCatalogItem]:
         items: List[PerfumeCatalogItem] = []
         for row in raw:
             try:
-                # Supabase returns arrays or null — pydantic will handle defaults
                 item = PerfumeCatalogItem(
                     id=str(row.get("id")),
                     name=str(row.get("name") or "").strip() or "Untitled",
@@ -196,35 +196,74 @@ def load_catalog_from_supabase() -> List[PerfumeCatalogItem]:
         return []
 
 
-def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
+# ---------- Price-band helpers ----------
+
+def resolve_price_band_from_filters(filters: Optional[RecommendFilters]) -> Optional[str]:
     """
-    Normalize price bands between frontend naming and DB values.
-    Frontend might send:
-      - "0-100", "100-200", "200+"
-      - OR "budget", "mid", "luxury"
-    DB uses "0-100", "100-200", "200+" in price_tier.
+    Normalize price bands from filters.price_band to DB values.
+    DB uses: '0-100', '100-200', '200+'.
     """
     if not filters or not filters.price_band:
         return None
 
     pb = filters.price_band.strip().lower()
 
-    if pb in ("0-100", "0 – 100", "0 — 100", "0_to_100", "0_100", "0 –100"):
+    if pb in ("0-100", "0 – 100", "0 — 100", "0_to_100", "0_100", "0–100"):
         return "0-100"
-    if pb in ("100-200", "100 – 200", "100 — 200", "100_to_200", "100_200"):
+    if pb in ("100-200", "100 – 200", "100 — 200", "100_to_200", "100_200", "100–200"):
         return "100-200"
-    if pb in ("200+", "200_plus", "200 – up", "200+ "):
+    if pb in ("200+", "200_plus", "200 – up", "200+ ", "200–up", "200 plus", "over 200"):
         return "200+"
 
-    # legacy labels:
+    # legacy labels (if you ever send them via filters.raw)
     if pb in ("budget", "$", "low"):
         return "0-100"
     if pb in ("mid", "$$", "medium"):
         return "100-200"
-    if pb in ("luxury", "$$$", "high"):
+    if pb in ("luxury", "$$$", "high", "premium"):
         return "200+"
 
     return None
+
+
+def infer_price_band_from_goal_text(goal: Optional[str]) -> Optional[str]:
+    """
+    Fallback: if the app didn't send filters.price_band,
+    we try to understand the band directly from the GOAL text.
+
+    This is why your new goal strings like:
+      "vibe: fresh / citrus | setting: casual day | budget: 0-100"
+    are important.
+    """
+    if not goal:
+        return None
+
+    g = goal.lower()
+
+    # 0–100 style
+    if "0-100" in g or "under 100" in g or "0–100" in g:
+        return "0-100"
+
+    # 100–200 style
+    if "100-200" in g or "100–200" in g:
+        return "100-200"
+
+    # 200+ / premium
+    if "200+" in g or "over 200" in g or "200 plus" in g or "premium budget" in g:
+        return "200+"
+
+    return None
+
+
+def resolve_price_band(req: RecommendRequest) -> Optional[str]:
+    """
+    1) Try explicit filters.price_band (if app ever sends it).
+    2) If missing, infer from GOAL text.
+    """
+    pb = resolve_price_band_from_filters(req.filters)
+    if pb:
+        return pb
+    return infer_price_band_from_goal_text(req.goal)
 
 
 def filter_catalog_for_request(
@@ -237,11 +276,12 @@ def filter_catalog_for_request(
     if not catalog:
         return []
 
-    price_band = resolve_price_band(req.filters)
+    price_band = resolve_price_band(req)
     filtered = catalog
 
     if price_band:
         filtered = [p for p in filtered if (p.price_tier or "").strip() == price_band]
+        print(f"🔎 filter_catalog_for_request: price_band={price_band}, kept={len(filtered)} of {len(catalog)}")
 
     # If filtering becomes too strict and nothing is left, fall back to full catalog.
     if not filtered:
@@ -283,6 +323,7 @@ def build_system_prompt() -> str:
         " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward catalog items whose notes/tags match that.\n"
         " - If PROFILE shows dislikes, avoid those notes/styles.\n"
         " - Avoid recommending things the user already OWNS unless there are not enough new options.\n"
+        " - If the GOAL clearly changes (different occasion, budget, or vibe), you should explore different perfumes that better match that new context, not always the same 3.\n"
         "\n"
         "Occasion examples:\n"
         " - \"oud for Eid\" → prefer rich, elegant ouds that feel festive and respectful.\n"
@@ -322,6 +363,8 @@ def build_user_prompt(req: RecommendRequest, catalog: List[PerfumeCatalogItem]) 
     """
     Convert the incoming request into a single structured user message
     that also includes the CATALOG (the only allowed options).
+    We also RANDOMIZE catalog order a bit so the model
+    doesn't always latch onto the same first few rows.
     """
     parts: List[str] = []
 
@@ -338,20 +381,22 @@ def build_user_prompt(req: RecommendRequest, catalog: List[PerfumeCatalogItem]) 
     )
 
     # Filters (if any)
-    if req.filters:
-        filters = req.filters
-        parts.append(
-            "FILTERS:\n"
-            f"  gender: {filters.gender}\n"
-            f"  region: {filters.region}\n"
-            f"  price_band: {filters.price_band}\n"
-            f"  raw: {filters.raw}"
-        )
+    price_band = resolve_price_band(req)
+    filters = req.filters
+    parts.append(
+        "FILTERS:\n"
+        f"  gender: {getattr(filters, 'gender', None) if filters else None}\n"
+        f"  region: {getattr(filters, 'region', None) if filters else None}\n"
+        f"  price_band: {price_band}\n"
+        f"  raw: {getattr(filters, 'raw', None) if filters else None}"
+    )
 
     parts.append(f"MAX_RESULTS: {req.max_results}")
 
-    # Catalog
-    lines = [p.to_catalog_line() for p in catalog]
+    # Catalog – shuffle for variety
+    shuffled = catalog[:]
+    random.shuffle(shuffled)
+    lines = [p.to_catalog_line() for p in shuffled]
     catalog_block = "\n".join(lines)
     parts.append(
         "CATALOG (you MUST only choose perfumes from this list):\n"
@@ -369,27 +414,21 @@ def clamp_items_to_catalog_and_price(
     """
     - Ensure every item actually exists in the catalog.
     - Re-check price band on the Python side.
-    - If items don't match or are empty, fall back to REAL catalog-based suggestions.
+    - If something doesn't match, drop it.
     """
     if not catalog:
         return []
 
-    # Helper to normalize names for matching
-    def normalize_name(s: str) -> str:
-        return "".join(c.lower() for c in s.strip() if c.isalnum() or c.isspace())
-
-    by_name = {normalize_name(p.name): p for p in catalog}
-    price_band = resolve_price_band(req.filters)
+    # Build lookup by lowercase name
+    by_name = {p.name.lower(): p for p in catalog}
+    price_band = resolve_price_band(req)
 
     cleaned: List[RecommendItem] = []
-
-    # First pass: try to use the model's items and map them to catalog
     for item in items:
         raw_name = (item.get("name") or "").strip()
         if not raw_name:
             continue
-
-        key = normalize_name(raw_name)
+        key = raw_name.lower()
         perfume = by_name.get(key)
         if not perfume:
             # Model tried to hallucinate or spelling mismatch; drop it
@@ -419,26 +458,32 @@ def clamp_items_to_catalog_and_price(
             )
         )
 
-    # If we dropped everything (or items was empty), build fallback from catalog
-    if not cleaned:
-        print("⚠️ clamp_items_to_catalog_and_price: no valid items after clamping, using catalog-based fallback.")
+    # If we dropped everything (model ignored catalog or price too strict),
+    # relax: ignore price band and just take any catalog-mappable ones.
+    if not cleaned and catalog:
+        print("⚠️ clamp_items_to_catalog_and_price: no valid items after clamping, relaxing constraints.")
 
-        # Use the same coarse filters as before (mainly price band).
-        fallback_catalog = filter_catalog_for_request(catalog, req)
-        if not fallback_catalog:
-            fallback_catalog = catalog
-
-        max_results = max(1, req.max_results)
-        for perfume in fallback_catalog[:max_results]:
-            # Build a short notes summary from catalog data
-            note_list = perfume.all_notes
-            notes = ", ".join(note_list[:6]) if note_list else None
-
+        by_name_all = {p.name.lower(): p for p in catalog}
+        for item in items:
+            raw_name = (item.get("name") or "").strip()
+            if not raw_name:
+                continue
+            key = raw_name.lower()
+            perfume = by_name_all.get(key)
+            if not perfume:
+                continue
+            reason = item.get("reason") or "No reason provided."
+            match_score = item.get("match_score") or 75
+            notes = item.get("notes")
+            try:
+                match_score_int = int(match_score)
+            except Exception:
+                match_score_int = 75
             cleaned.append(
                 RecommendItem(
                     name=perfume.name,
-                    reason=f"Fits your goal \"{req.goal}\" based on catalog notes, style and price band.",
-                    match_score=80,
+                    reason=reason,
+                    match_score=max(0, min(100, match_score_int)),
                     notes=notes,
                 )
             )
@@ -448,14 +493,15 @@ def clamp_items_to_catalog_and_price(
     return cleaned[:max_results]
 
 
-# ---------- Hard fallback (only when catalog is unavailable / fatal errors) ----------
+# ---------- Hard fallback (never return empty) ----------
 
 def build_fallback_items(req: RecommendRequest) -> List[RecommendItem]:
     """
     Last-resort offline recommendations if:
-    - Supabase catalog is empty / not configured, or
-    - A fatal internal error occurs before we can use the catalog.
-    These are NOT catalog-bound; they are just to avoid returning an empty list.
+    - Supabase catalog is empty, or
+    - Model returns no items, or
+    - Clamping removes everything.
+    These are not catalog-bound, but guarantee the app always shows something.
     """
     goal = req.goal.strip()
     base_reason = f"Fits your request: {goal}."
@@ -500,7 +546,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     Catalog-aware when Supabase is available, with a hard-coded safety
-    fallback only when the catalog is unavailable or on fatal errors.
+    fallback so you NEVER return an empty items array.
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
@@ -553,10 +599,10 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             data = json.loads(raw_json)
         except Exception as e:
             print(f"❗️/recommend decode failed. Raw body: {raw_json}")
-            # If the model returned garbage, use catalog-based fallback.
-            cleaned_items = clamp_items_to_catalog_and_price([], catalog, req)
+            # If the model returned garbage, use hard fallback.
+            fallback_items = build_fallback_items(req)
             return RecommendResponse(
-                items=cleaned_items,
+                items=fallback_items,
                 used_profile=UsedProfile(
                     likes=req.prefs.likes,
                     dislikes=req.prefs.dislikes,
@@ -577,11 +623,26 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
 
         request_id = data.get("request_id") or completion.id
 
-        # Items from the model (may be empty)
+        # Items from the model
         items_data = data.get("items") or []
 
-        # Clamp to catalog + price band (with internal catalog-based fallback)
+        # If the model gave us no items at all, hard fallback immediately.
+        if not items_data:
+            print("⚠️ Model returned empty items — using hard fallback recommendations.")
+            fallback_items = build_fallback_items(req)
+            return RecommendResponse(
+                items=fallback_items,
+                used_profile=used_profile_obj,
+                request_id=request_id,
+            )
+
+        # Clamp to catalog + price band
         cleaned_items = clamp_items_to_catalog_and_price(items_data, catalog, req)
+
+        # If clamping removed everything, hard fallback.
+        if not cleaned_items:
+            print("⚠️ No items remained after clamping — using hard fallback recommendations.")
+            cleaned_items = build_fallback_items(req)
 
         return RecommendResponse(
             items=cleaned_items,
@@ -593,7 +654,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         raise
     except Exception as e:
         print("❌ /recommend unexpected error:", repr(e))
-        # On unexpected error, use hard fallback (catalog might be unusable here).
+        # On unexpected error, also try hard fallback instead of pure 500.
         fallback_items = build_fallback_items(req)
         return RecommendResponse(
             items=fallback_items,
