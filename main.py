@@ -6,6 +6,8 @@
 # - Filters by price_band (0-100 / 100-200 / 200+)
 # - Uses OpenAI to RANK a candidate list by index (no name-mismatch issues)
 # - Returns top N items with reasons + match_score
+# - If anything fails or catalog is empty: returns items = [] so the iOS app
+#   can fall back to its own offline CSV engine.
 #
 
 from fastapi import FastAPI, HTTPException
@@ -25,7 +27,7 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ---------- FastAPI app ----------
 
-BACKEND_VERSION = "4.1.0-ranker"
+BACKEND_VERSION = "4.1.1-ranker-no-fallback"
 app = FastAPI(title="ScentFeed Web AI", version=BACKEND_VERSION)
 
 # ---------- Pydantic models (wire contract with the iOS app) ----------
@@ -345,7 +347,6 @@ def build_user_prompt(req: RecommendRequest, candidates: List[Dict[str, Any]]) -
 
     parts.append(f"MAX_RESULTS: {req.max_results}")
 
-    # Candidate list
     lines = [summarize_candidate(i, row) for i, row in enumerate(candidates)]
     catalog_block = "\n".join(lines)
     parts.append(
@@ -395,41 +396,6 @@ def filter_candidates_for_request(
     return filtered
 
 
-# ---------- Hard fallback (never return empty) ----------
-
-def build_simple_fallback_items(goal: str) -> List[RecommendItem]:
-    """
-    Last-resort recommendations if:
-    - Catalog is empty, or
-    - Model returns no items / invalid JSON, or
-    - Something blows up.
-    These are generic, not catalog-bound.
-    """
-    g = goal.strip()
-    base_reason = f"Fits your request: {g}."
-
-    return [
-        RecommendItem(
-            name="Dior Sauvage Eau de Toilette",
-            reason=base_reason + " Versatile fresh 'blue' scent that works for many situations.",
-            match_score=88,
-            notes="bergamot, pepper, ambroxan",
-        ),
-        RecommendItem(
-            name="Parfums de Marly Layton",
-            reason=base_reason + " Sweet, spicy and mass-appealing; great for dates and evenings.",
-            match_score=86,
-            notes="apple, vanilla, cardamom",
-        ),
-        RecommendItem(
-            name="Chanel Bleu de Chanel Eau de Parfum",
-            reason=base_reason + " Modern, classy blue scent that feels put-together and safe.",
-            match_score=84,
-            notes="citrus, incense, woods",
-        ),
-    ]
-
-
 # ---------- Routes ----------
 
 
@@ -453,12 +419,12 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     - Filters candidates by price_band
     - Asks OpenAI to RANK by candidate_index
     - Maps back to real perfumes and returns top N
+    - If anything fails: items = [], so iOS can fall back to offline CSV.
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
         raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
-    # Normalize prefs so downstream code always sees lists
     likes = req.prefs.likes or []
     dislikes = req.prefs.dislikes or []
     owned = req.prefs.owned or []
@@ -468,25 +434,33 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     catalog_all = load_catalog_from_supabase()
 
     if not catalog_all:
-        print("⚠️ Catalog empty or Supabase not configured — returning simple fallback recommendations.")
-        fallback_items = build_simple_fallback_items(goal)
+        print("⚠️ Catalog empty or Supabase not configured — returning items = [] so app can use offline CSV.")
         return RecommendResponse(
-            items=fallback_items,
+            items=[],
             used_profile=UsedProfile(
                 likes=likes,
                 dislikes=dislikes,
                 owned=owned,
                 wishlist=wishlist,
             ),
-            request_id="fallback-no-catalog",
+            request_id="no-catalog",
         )
 
     # 2) Build candidate list for this request
     candidates = filter_candidates_for_request(catalog_all, req)
 
     if not candidates:
-        print("⚠️ No candidates after filtering, falling back to full catalog for ranking.")
-        candidates = catalog_all[:60]  # defensive cap
+        print("⚠️ No candidates after filtering, returning items = [] so app can use offline CSV.")
+        return RecommendResponse(
+            items=[],
+            used_profile=UsedProfile(
+                likes=likes,
+                dislikes=dislikes,
+                owned=owned,
+                wishlist=wishlist,
+            ),
+            request_id="no-candidates-after-filter",
+        )
 
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(req, candidates)
@@ -514,24 +488,21 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             f"candidates={len(candidates)}"
         )
 
-        # Parse JSON from the model
         try:
             data = json.loads(raw_json)
         except Exception:
             print(f"❗️/recommend decode failed. Raw body: {raw_json!r}")
-            fallback_items = build_simple_fallback_items(goal)
             return RecommendResponse(
-                items=fallback_items,
+                items=[],
                 used_profile=UsedProfile(
                     likes=likes,
                     dislikes=dislikes,
                     owned=owned,
                     wishlist=wishlist,
                 ),
-                request_id=f"fallback-decode-error-{completion.id}",
+                request_id=f"decode-error-{completion.id}",
             )
 
-        # used_profile from model (or default)
         used_profile_data = data.get("used_profile") or {}
         used_profile = UsedProfile(
             likes=used_profile_data.get("likes") or likes,
@@ -540,7 +511,6 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             wishlist=used_profile_data.get("wishlist") or wishlist,
         )
 
-        # items from model: candidate_index + reason + score + notes
         items_data = data.get("items") or []
         cleaned_items: List[RecommendItem] = []
 
@@ -576,12 +546,17 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
                 )
             )
 
-        if not cleaned_items:
-            print("⚠️ Model returned empty/invalid ranked items — using simple fallback recommendations.")
-            cleaned_items = build_simple_fallback_items(goal)
-
         max_results = max(1, req.max_results)
         cleaned_items = cleaned_items[:max_results]
+
+        # If model gave nothing usable, let iOS use offline CSV.
+        if not cleaned_items:
+            print("⚠️ Model returned empty/invalid ranked items — returning items = [] so app can use offline CSV.")
+            return RecommendResponse(
+                items=[],
+                used_profile=used_profile,
+                request_id=data.get("request_id") or completion.id,
+            )
 
         request_id = data.get("request_id") or completion.id
 
@@ -595,16 +570,15 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         raise
     except Exception as e:
         print("❌ /recommend unexpected error:", repr(e))
-        fallback_items = build_simple_fallback_items(goal)
         return RecommendResponse(
-            items=fallback_items,
+            items=[],
             used_profile=UsedProfile(
                 likes=likes,
                 dislikes=dislikes,
                 owned=owned,
                 wishlist=wishlist,
             ),
-            request_id="fallback-internal-error",
+            request_id="internal-error",
         )
 
 
