@@ -3,12 +3,10 @@
 # ScentFeed Web AI backend (TikTok/Meta-style ranker)
 #
 # - Loads perfumes from Supabase `perfumes` table
-# - Filters by price_band (0-100 / 100-200 / 200+)
-# - Uses OpenAI to RANK a candidate list by index (no name-mismatch issues)
-# - Returns top N items with reasons + match_score
-# - If anything fails or catalog is empty: returns items = [] so the iOS app
-#   can fall back to its own offline CSV engine.
-#
+# - Strictly filters by scent + price band when possible
+# - Can flex price by ~20% if needed to reach 3 candidates
+# - Uses OpenAI to RANK a candidate list by index
+# - ALWAYS returns catalog-based perfumes (no hardcoded Dior/Chanel fallback)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -27,43 +25,33 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ---------- FastAPI app ----------
 
-BACKEND_VERSION = "4.1.1-ranker-no-fallback"
+BACKEND_VERSION = "4.2.0-ranked-scoring"
+
 app = FastAPI(title="ScentFeed Web AI", version=BACKEND_VERSION)
 
 # ---------- Pydantic models (wire contract with the iOS app) ----------
 
 
 class Prefs(BaseModel):
-    """
-    User preference payload from the app.
-
-    IMPORTANT: We allow these to be Optional so that if the client sends
-    null or omits them, the request still validates. We normalize to []
-    when we actually use them.
-    """
-    likes: Optional[List[str]] = None
-    dislikes: Optional[List[str]] = None
-    owned: Optional[List[str]] = None
-    wishlist: Optional[List[str]] = None
-
-
-class RecommendFilters(BaseModel):
-    """
-    Filters coming from the app.
-    We mainly care about price_band, but we forward gender/region/raw as hints.
-    """
-    gender: Optional[str] = None          # "male" | "female" | "unisex"
-    region: Optional[str] = None          # "pakistan", "gulf", "europe", ...
-    price_band: Optional[str] = None      # "0-100", "100-200", "200+"
-    raw: Optional[Dict[str, Any]] = None  # any extra future stuff
+    likes: List[str] = Field(default_factory=list)
+    dislikes: List[str] = Field(default_factory=list)
+    owned: List[str] = Field(default_factory=list)
+    wishlist: List[str] = Field(default_factory=list)
 
 
 class RecommendRequest(BaseModel):
+    """
+    Flexible filters: we accept any shape here as a dict to avoid 422s
+    when the iOS side sends extra keys.
+    """
     uid: Optional[str] = None
     goal: str
     max_results: int = 3
     prefs: Prefs
-    filters: Optional[RecommendFilters] = None
+    filters: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"
 
 
 class RecommendItem(BaseModel):
@@ -109,7 +97,7 @@ _CATALOG_TTL_SECONDS = 300  # 5 minutes
 def load_catalog_from_supabase() -> List[Dict[str, Any]]:
     """
     Fetch all rows from public.perfumes via Supabase REST.
-    We treat the rows as generic dicts with at least:
+    Expected fields (loose):
       - name (text)
       - brand (text)
       - description (text, nullable)
@@ -117,6 +105,7 @@ def load_catalog_from_supabase() -> List[Dict[str, Any]]:
       - price (numeric/text, nullable)
       - notes_top / notes_heart / notes_base (text[] or string, nullable)
       - projection / longevity / celebrity_endorsers (optional)
+      - scent_tags / setting_tags / gender (string or string[])
     """
     global _catalog_cache
 
@@ -138,6 +127,7 @@ def load_catalog_from_supabase() -> List[Dict[str, Any]]:
         "Accept": "application/json",
     }
     params = {"select": "*"}
+
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
@@ -174,15 +164,67 @@ def trimmed_or_none(value: Optional[str]) -> Optional[str]:
     return v or None
 
 
-def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
+def parse_structured_goal(goal: str) -> Dict[str, Optional[str]]:
+    """
+    Parse goal strings like:
+      "scent: fresh | setting: every day | budget: 0-100"
+    into:
+      {"scent": "fresh", "setting": "every day", "price_band": "0-100"}
+    """
+    result: Dict[str, Optional[str]] = {
+        "scent": None,
+        "setting": None,
+        "price_band": None,
+    }
+    parts = [p.strip() for p in goal.split("|")]
+    for part in parts:
+        lower = part.lower()
+        if lower.startswith("scent:"):
+            result["scent"] = part.split(":", 1)[1].strip().lower()
+        elif lower.startswith("setting:"):
+            result["setting"] = part.split(":", 1)[1].strip().lower()
+        elif lower.startswith("budget:") or lower.startswith("price:"):
+            result["price_band"] = part.split(":", 1)[1].strip().lower()
+    return result
+
+
+def parse_tags(value: Any) -> List[str]:
+    """
+    Normalize scent_tags / setting_tags / gender-like fields into a list[str] (lowercased).
+    Can handle:
+      - null
+      - ["Fresh", "Citrus"]
+      - "Fresh, Citrus"
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip().lower() for x in value if str(x).strip()]
+    # treat as comma-separated string
+    return [t.strip().lower() for t in str(value).split(",") if t.strip()]
+
+
+def resolve_price_band(filters: Optional[Dict[str, Any]], parsed_goal_band: Optional[str]) -> Optional[str]:
     """
     Normalize price bands between frontend naming and DB values.
     We expect DB price_band values like: "0-100", "100-200", "200+".
+    Prefer explicit filters, then parsed goal.
     """
-    if not filters or not filters.price_band:
+    band = None
+    if filters:
+        # Support both snake_case and camelCase keys
+        band = (
+            filters.get("price_band")
+            or filters.get("priceBand")
+            or filters.get("budget")
+        )
+    if not band and parsed_goal_band:
+        band = parsed_goal_band
+
+    if not band:
         return None
 
-    pb = filters.price_band.strip().lower()
+    pb = str(band).strip().lower()
 
     if pb in ("0-100", "0 – 100", "0 — 100", "0_to_100", "0_100", "0 –100"):
         return "0-100"
@@ -191,7 +233,7 @@ def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
     if pb in ("200+", "200_plus", "200 – up", "200+ "):
         return "200+"
 
-    # fallback: if user gives "under100" etc, map roughly
+    # fallback: rough mapping
     if "0" in pb and "100" in pb:
         return "0-100"
     if "100" in pb and "200" in pb:
@@ -202,37 +244,81 @@ def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
     return None
 
 
+def flexible_price_range(resolved_band: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    20% flex around band boundaries.
+    - "0-100"   → 0 .. 120, target_mid ~ 50
+    - "100-200" → 80 .. 240, target_mid ~ 150
+    - "200+"    → 160 .. None, target_mid ~ 250
+    Returns (lo, hi, target_mid)
+    """
+    if resolved_band == "0-100":
+        return 0.0, 120.0, 50.0
+    if resolved_band == "100-200":
+        return 80.0, 240.0, 150.0
+    if resolved_band == "200+":
+        return 160.0, None, 250.0
+    return None, None, None
+
+
+def to_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
 def build_system_prompt() -> str:
     """
     System prompt for RANKING:
     - Model sees a candidate list with INDEXES.
     - It must output JSON with candidate_index, reason, match_score, notes.
+    - We embed our scoring preferences here.
     """
     return (
-        "You are ScentFeed, a professional perfume recommendation engine.\n"
+        "You are ScentFeed, a professional perfume recommendation engine used in a mobile app.\n"
         "\n"
         "You are given:\n"
-        " - A natural language GOAL.\n"
+        " - A natural language GOAL which may encode SCENT, SETTING and BUDGET.\n"
+        " - A structured SUMMARY of the parsed SCENT / SETTING / PRICE_BAND.\n"
         " - A PROFILE (likes / dislikes / owned / wishlist).\n"
-        " - Optional FILTERS (region, gender, price_band).\n"
-        " - A CANDIDATE LIST of perfumes from the catalog, each with an INDEX.\n"
+        " - Optional FILTERS (gender, region, raw JSON).\n"
+        " - A CANDIDATE LIST of perfumes from the catalog, each with an integer INDEX.\n"
         "\n"
         "Your job:\n"
         " - RANK the candidates for how well they fit the GOAL and PROFILE.\n"
-        " - You MUST ONLY choose perfumes from the candidate list.\n"
-        " - Refer to perfumes by their integer candidate_index.\n"
-        " - Respect price_band as much as possible (candidates are already filtered).\n"
-        " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward matching notes.\n"
-        " - If PROFILE shows dislikes, avoid them.\n"
-        " - Avoid recommending things the user already OWNS unless there are not enough new options.\n"
-        " - Vary your top picks when the GOAL clearly changes (different vibe / setting / budget).\n"
+        " - You MUST ONLY choose perfumes from the candidate list (by candidate_index).\n"
+        " - Always try to return up to 3 items.\n"
         "\n"
-        "Occasion hints:\n"
-        " - \"office\" → clean, non-offensive, moderate projection.\n"
-        " - \"gym\" → very fresh, light, not cloying.\n"
-        " - \"clubbing\" → louder, sexy, attention-grabbing.\n"
-        " - \"date night\" → intimate, attractive, usually sweeter.\n"
-        " - \"special event\" / \"wedding\" → elegant, long-lasting, signature-worthy.\n"
+        "SCORING PRIORITIES (think in a rough numeric way):\n"
+        " 1) SCENT is most important (like +40 points if the scent family matches what the user asked for).\n"
+        " 2) PRICE is also very important:\n"
+        "    - Prefer perfumes in the requested price_band exactly.\n"
+        "    - If there are not enough in that band, you may include perfumes within roughly 20% of the price range.\n"
+        "    - When you step outside the strict band, mention that briefly in the reason.\n"
+        " 3) SETTING is helpful but secondary:\n"
+        "    - If setting tags match the chosen setting (e.g. 'Work', 'Every Day', 'Date Night', 'Night Out', 'Summer', 'Gym', etc.), treat that like +10–15 points.\n"
+        "    - If setting is adjacent (e.g. 'Night Out' vs 'Date Night', 'Work' vs 'Every Day'), give a smaller bonus.\n"
+        " 4) PROFILE PERSONALIZATION:\n"
+        "    - If the perfume name appears in likes, boost strongly (like +25 points).\n"
+        "    - If the brand appears in likes or wishlist, small bonus (like +8 points).\n"
+        "    - If the perfume is in dislikes, strongly penalize (like -40 points).\n"
+        "    - If the brand is in dislikes, small penalty.\n"
+        "    - If the perfume is already owned, lightly down-rank (we still show it if options are limited).\n"
+        "    - If the perfume is in wishlist, boost.\n"
+        "\n"
+        "Occasion hints for SETTING:\n"
+        " - 'work' or 'office' → clean, non-offensive, moderate projection.\n"
+        " - 'gym' → very fresh, light, not cloying.\n"
+        " - 'night out' or 'clubbing' → louder, sexy, attention-grabbing.\n"
+        " - 'date night' → intimate, attractive, often sweeter or more sensual.\n"
+        " - 'summer' → airy, citrus, fresh, not heavy.\n"
+        " - 'winter' or 'cozy' → warmer, sweeter, heavier, more amber/vanilla/spice.\n"
+        "\n"
+        "DIVERSITY:\n"
+        " - When multiple candidates are very close in score, prefer variety in brands and note profiles instead of making all 3 nearly identical.\n"
         "\n"
         "VERY IMPORTANT RESPONSE FORMAT:\n"
         " - You MUST answer with ONLY valid, minified JSON.\n"
@@ -242,11 +328,11 @@ def build_system_prompt() -> str:
         "     \"items\": [\n"
         "       {\n"
         "         \"candidate_index\": 0,\n"
-        "         \"reason\": \"short explanation (1-2 sentences)\",\n"
-        "         \"match_score\": 0-100,\n"
+        "         \"reason\": \"short explanation (1–2 sentences)\",\n"
+        "         \"match_score\": 0–100,\n"
         "         \"notes\": \"optional, short comma-separated key notes\" or null\n"
         "       },\n"
-        "       ...\n"
+        "       ... (up to 3 items)\n"
         "     ],\n"
         "     \"used_profile\": {\n"
         "       \"likes\": [...],\n"
@@ -273,6 +359,9 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
     price = row.get("price")
     projection = (row.get("projection") or "").strip() or "unknown"
     longevity = (row.get("longevity") or "").strip() or "unknown"
+    scent_tags = ", ".join(parse_tags(row.get("scent_tags")))
+    setting_tags = ", ".join(parse_tags(row.get("setting_tags")))
+    gender = ", ".join(parse_tags(row.get("gender")))
 
     def normalize_notes(field: str) -> List[str]:
         v = row.get(field)
@@ -280,6 +369,7 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
             return []
         if isinstance(v, list):
             return [str(x).strip() for x in v if str(x).strip()]
+        # treat as string
         parts = str(v).split(",")
         return [p.strip() for p in parts if p.strip()]
 
@@ -302,6 +392,12 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
         f"projection: {projection}",
         f"longevity: {longevity}",
     ]
+    if gender:
+        parts.append(f"gender: {gender}")
+    if scent_tags:
+        parts.append(f"scent_tags: {scent_tags}")
+    if setting_tags:
+        parts.append(f"setting_tags: {setting_tags}")
     if notes_str:
         parts.append(f"notes: {notes_str}")
     if description:
@@ -312,41 +408,36 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
 
 def build_user_prompt(req: RecommendRequest, candidates: List[Dict[str, Any]]) -> str:
     """
-    User prompt that includes GOAL, PROFILE, FILTERS and the CANDIDATE LIST.
+    User prompt that includes GOAL, parsed SCENT/SETTING/PRICE, PROFILE, FILTERS and CANDIDATES.
     """
-
-    prefs = req.prefs
-    likes = prefs.likes or []
-    dislikes = prefs.dislikes or []
-    owned = prefs.owned or []
-    wishlist = prefs.wishlist or []
+    parsed = parse_structured_goal(req.goal)
 
     parts: List[str] = []
 
     parts.append(f"GOAL: {req.goal.strip()}")
 
     parts.append(
-        "PROFILE:\n"
-        f"  likes: {likes}\n"
-        f"  dislikes: {dislikes}\n"
-        f"  owned: {owned}\n"
-        f"  wishlist: {wishlist}"
+        "STRUCTURED_GOAL:\n"
+        f"  scent: {parsed.get('scent')}\n"
+        f"  setting: {parsed.get('setting')}\n"
+        f"  price_band: {parsed.get('price_band')}"
     )
 
-    if req.filters:
-        f = req.filters
-        parts.append(
-            "FILTERS:\n"
-            f"  gender: {f.gender}\n"
-            f"  region: {f.region}\n"
-            f"  price_band: {f.price_band}\n"
-            f"  raw: {f.raw}"
-        )
-    else:
-        parts.append("FILTERS:\n  gender: null\n  region: null\n  price_band: null\n  raw: null")
+    prefs = req.prefs
+    parts.append(
+        "PROFILE:\n"
+        f"  likes: {prefs.likes}\n"
+        f"  dislikes: {prefs.dislikes}\n"
+        f"  owned: {prefs.owned}\n"
+        f"  wishlist: {prefs.wishlist}"
+    )
+
+    filters = req.filters or {}
+    parts.append("FILTERS_JSON:\n" + json.dumps(filters, ensure_ascii=False))
 
     parts.append(f"MAX_RESULTS: {req.max_results}")
 
+    # Candidate list
     lines = [summarize_candidate(i, row) for i, row in enumerate(candidates)]
     catalog_block = "\n".join(lines)
     parts.append(
@@ -363,34 +454,141 @@ def filter_candidates_for_request(
     max_candidates: int = 60,
 ) -> List[Dict[str, Any]]:
     """
-    Filter by price_band and optionally sample / truncate to a manageable size.
+    Filter by:
+      - scent tag (strict)
+      - price_band (strict, then ~20% flex if < needed)
+      - gender (if provided)
+    Then truncate to max_candidates.
     """
     if not catalog:
         return []
 
-    resolved_band = resolve_price_band(req.filters)
-    filtered = catalog
+    parsed = parse_structured_goal(req.goal)
+    target_scent = (parsed.get("scent") or "").lower().strip() or None
+    parsed_price_band = parsed.get("price_band")
+    filters = req.filters or {}
 
+    # gender filter (optional)
+    gender_filter = None
+    if "gender" in filters:
+        gender_filter = str(filters.get("gender") or "").lower().strip()
+    elif "selectedGender" in filters:
+        gender_filter = str(filters.get("selectedGender") or "").lower().strip()
+
+    resolved_band = resolve_price_band(filters, parsed_price_band)
+
+    # First pass: scent + gender filter only
+    def scent_gender_ok(row: Dict[str, Any]) -> bool:
+        if target_scent:
+            row_scent_tags = parse_tags(row.get("scent_tags"))
+            if target_scent not in row_scent_tags:
+                return False
+
+        if gender_filter:
+            row_gender_tags = parse_tags(row.get("gender"))
+            # keep if exact gender or unisex
+            if gender_filter not in row_gender_tags and "unisex" not in row_gender_tags:
+                return False
+
+        return True
+
+    base_pool = [r for r in catalog if scent_gender_ok(r)]
+
+    if not base_pool:
+        # No exact scent+gender matches -> as a last resort use full catalog
+        print(
+            f"⚠️ No perfumes matched scent={target_scent!r} and gender={gender_filter!r}; "
+            f"falling back to full catalog of {len(catalog)} perfumes."
+        )
+        base_pool = catalog[:]
+
+    # Second pass: strict price_band filter within base_pool
+    strict_candidates: List[Dict[str, Any]] = []
     if resolved_band:
-        def match_band(row: Dict[str, Any]) -> bool:
-            rb = (row.get("price_band") or "").strip()
-            return rb == resolved_band
+        for r in base_pool:
+            rb = (r.get("price_band") or "").strip()
+            if rb == resolved_band:
+                strict_candidates.append(r)
+    else:
+        strict_candidates = base_pool[:]
 
-        band_matches = [r for r in catalog if match_band(r)]
-        if band_matches:
-            filtered = band_matches
-        else:
-            print(
-                f"⚠️ No perfumes matched price_band='{resolved_band}' in Supabase; "
-                f"falling back to full catalog of {len(catalog)} perfumes."
+    min_needed = max(3, req.max_results)
+
+    if len(strict_candidates) >= min_needed:
+        filtered = strict_candidates
+        price_flex_used = False
+    else:
+        # Not enough strict band matches → apply 20% flex on numeric price
+        lo, hi, target_mid = flexible_price_range(resolved_band) if resolved_band else (None, None, None)
+        flex_candidates: List[Dict[str, Any]] = []
+
+        if lo is not None:
+            for r in base_pool:
+                price_val = to_float_or_none(r.get("price"))
+                if price_val is None:
+                    continue
+                if hi is not None:
+                    if lo <= price_val <= hi:
+                        flex_candidates.append(r)
+                else:
+                    if price_val >= lo:
+                        flex_candidates.append(r)
+
+        # Combine strict + flex (unique by id/name)
+        seen_ids = set()
+        combined: List[Dict[str, Any]] = []
+
+        def add_unique(rows: List[Dict[str, Any]]) -> None:
+            for row in rows:
+                key = row.get("id") or row.get("name")
+                if not key:
+                    continue
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                combined.append(row)
+
+        add_unique(strict_candidates)
+        add_unique(flex_candidates)
+
+        # If still not enough, just fill from base_pool by proximity to target_mid
+        if len(combined) < min_needed and target_mid is not None:
+            remaining: List[Dict[str, Any]] = []
+            for r in base_pool:
+                key = r.get("id") or r.get("name")
+                if not key or key in seen_ids:
+                    continue
+                price_val = to_float_or_none(r.get("price"))
+                if price_val is None:
+                    continue
+                remaining.append(r)
+
+            remaining.sort(
+                key=lambda r: abs(
+                    (to_float_or_none(r.get("price")) or target_mid) - target_mid
+                )
             )
+            for r in remaining:
+                key = r.get("id") or r.get("name")
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                combined.append(r)
+                if len(combined) >= min_needed:
+                    break
 
+        filtered = combined
+        price_flex_used = True
+
+    # Truncate to max_candidates
     if len(filtered) > max_candidates:
         filtered = filtered[:max_candidates]
 
     print(
         f"🧪 Candidate selection: {len(filtered)} perfumes after filters "
-        f"(price_band={resolved_band or 'any'}, total_catalog={len(catalog)})"
+        f"(scent={target_scent or 'any'}, price_band={resolved_band or 'any'}, "
+        f"gender={gender_filter or 'any'}, price_flex_used={price_flex_used}, "
+        f"total_catalog={len(catalog)})"
     )
 
     return filtered
@@ -416,51 +614,31 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     - Loads Supabase catalog
-    - Filters candidates by price_band
+    - Filters candidates by scent + price_band (with 20% flex if needed)
     - Asks OpenAI to RANK by candidate_index
-    - Maps back to real perfumes and returns top N
-    - If anything fails: items = [], so iOS can fall back to offline CSV.
+    - Maps back to real perfumes and returns top N (up to 3)
     """
     goal = trimmed_or_none(req.goal)
     if not goal:
         raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
-    likes = req.prefs.likes or []
-    dislikes = req.prefs.dislikes or []
-    owned = req.prefs.owned or []
-    wishlist = req.prefs.wishlist or []
+    max_results = max(1, min(req.max_results, 3))  # app wants 3, but clamp for safety
 
     # 1) Load catalog
     catalog_all = load_catalog_from_supabase()
 
     if not catalog_all:
-        print("⚠️ Catalog empty or Supabase not configured — returning items = [] so app can use offline CSV.")
-        return RecommendResponse(
-            items=[],
-            used_profile=UsedProfile(
-                likes=likes,
-                dislikes=dislikes,
-                owned=owned,
-                wishlist=wishlist,
-            ),
-            request_id="no-catalog",
-        )
+        # No catalog → let the app use offline CSV fallback instead of random hardcoded items
+        print("⚠️ Catalog empty or Supabase not configured — returning 503 to trigger offline fallback.")
+        raise HTTPException(status_code=503, detail="Catalog unavailable.")
 
     # 2) Build candidate list for this request
-    candidates = filter_candidates_for_request(catalog_all, req)
+    candidates = filter_candidates_for_request(catalog_all, req, max_candidates=60)
 
+    # If somehow still no candidates (tiny DB), return 503 so iOS uses offline CSV
     if not candidates:
-        print("⚠️ No candidates after filtering, returning items = [] so app can use offline CSV.")
-        return RecommendResponse(
-            items=[],
-            used_profile=UsedProfile(
-                likes=likes,
-                dislikes=dislikes,
-                owned=owned,
-                wishlist=wishlist,
-            ),
-            request_id="no-candidates-after-filter",
-        )
+        print("⚠️ No candidates after filtering — returning 503 to trigger offline CSV fallback.")
+        raise HTTPException(status_code=503, detail="No candidates after filtering.")
 
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(req, candidates)
@@ -485,32 +663,27 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
 
         print(
             f"🌐 /recommend status: 200, latency={latency_ms}ms, "
-            f"candidates={len(candidates)}"
+            f"candidates={len(candidates)}, goal={goal!r}"
         )
 
+        # Parse JSON from the model
         try:
             data = json.loads(raw_json)
         except Exception:
             print(f"❗️/recommend decode failed. Raw body: {raw_json!r}")
-            return RecommendResponse(
-                items=[],
-                used_profile=UsedProfile(
-                    likes=likes,
-                    dislikes=dislikes,
-                    owned=owned,
-                    wishlist=wishlist,
-                ),
-                request_id=f"decode-error-{completion.id}",
-            )
+            # Decode error → let app use offline CSV instead of hardcoded perfumes
+            raise HTTPException(status_code=502, detail="LLM decode error.")
 
-        used_profile_data = data.get("used_profile") or {}
-        used_profile = UsedProfile(
-            likes=used_profile_data.get("likes") or likes,
-            dislikes=used_profile_data.get("dislikes") or dislikes,
-            owned=used_profile_data.get("owned") or owned,
-            wishlist=used_profile_data.get("wishlist") or wishlist,
+        # used_profile from model (or default)
+        used_profile = data.get("used_profile") or {}
+        used_profile_obj = UsedProfile(
+            likes=used_profile.get("likes") or req.prefs.likes,
+            dislikes=used_profile.get("dislikes") or req.prefs.dislikes,
+            owned=used_profile.get("owned") or req.prefs.owned,
+            wishlist=used_profile.get("wishlist") or req.prefs.wishlist,
         )
 
+        # items from model: candidate_index + reason + score + notes
         items_data = data.get("items") or []
         cleaned_items: List[RecommendItem] = []
 
@@ -546,39 +719,28 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
                 )
             )
 
-        max_results = max(1, req.max_results)
+        # Keep at most max_results
         cleaned_items = cleaned_items[:max_results]
 
-        # If model gave nothing usable, let iOS use offline CSV.
+        # If the model gave us no usable items, tell the app to use offline CSV
         if not cleaned_items:
-            print("⚠️ Model returned empty/invalid ranked items — returning items = [] so app can use offline CSV.")
-            return RecommendResponse(
-                items=[],
-                used_profile=used_profile,
-                request_id=data.get("request_id") or completion.id,
-            )
+            print("⚠️ Model returned empty/invalid ranked items — 502 to trigger offline CSV fallback.")
+            raise HTTPException(status_code=502, detail="LLM returned no items.")
 
         request_id = data.get("request_id") or completion.id
 
         return RecommendResponse(
             items=cleaned_items,
-            used_profile=used_profile,
+            used_profile=used_profile_obj,
             request_id=request_id,
         )
 
     except HTTPException:
+        # Already a proper error for the app to interpret
         raise
     except Exception as e:
         print("❌ /recommend unexpected error:", repr(e))
-        return RecommendResponse(
-            items=[],
-            used_profile=UsedProfile(
-                likes=likes,
-                dislikes=dislikes,
-                owned=owned,
-                wishlist=wishlist,
-            ),
-            request_id="internal-error",
-        )
+        # Generic error → iOS will use offline CSV fallback
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
