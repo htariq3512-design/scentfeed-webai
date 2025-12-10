@@ -3,11 +3,7 @@
 # ScentFeed Web AI backend (TikTok/Meta-style ranker)
 #
 # - Loads perfumes from Supabase `perfumes` table
-# - Filters by:
-#     - price_band or numeric price (with ~10% tolerance)
-#     - scent_tags (hard constraint if provided)
-#     - gender (strong filter if provided)
-#     - setting_tags (strong preference; hard only if there are matches)
+# - Filters by price_band (0-100 / 100-200 / 200+)
 # - Uses OpenAI to RANK a candidate list by index (no name-mismatch issues)
 # - Returns top N items with reasons + match_score
 #
@@ -29,35 +25,34 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ---------- FastAPI app ----------
 
-app = FastAPI(title="ScentFeed Web AI", version="5.0.0-tags-aware")
+BACKEND_VERSION = "4.1.0-ranker"
+app = FastAPI(title="ScentFeed Web AI", version=BACKEND_VERSION)
 
 # ---------- Pydantic models (wire contract with the iOS app) ----------
 
 
 class Prefs(BaseModel):
-    likes: List[str] = Field(default_factory=list)
-    dislikes: List[str] = Field(default_factory=list)
-    owned: List[str] = Field(default_factory=list)
-    wishlist: List[str] = Field(default_factory=list)
+    """
+    User preference payload from the app.
+
+    IMPORTANT: We allow these to be Optional so that if the client sends
+    null or omits them, the request still validates. We normalize to []
+    when we actually use them.
+    """
+    likes: Optional[List[str]] = None
+    dislikes: Optional[List[str]] = None
+    owned: Optional[List[str]] = None
+    wishlist: Optional[List[str]] = None
 
 
 class RecommendFilters(BaseModel):
     """
     Filters coming from the app.
-
-    New fields:
-    - scent_tag: canonical scent tag from your fixed list
-      (e.g. "fresh", "citrus", "sweet", "oud", ...)
-    - setting_tag: canonical setting tag
-      (e.g. "work", "every day", "date night", "night out", ...)
-
-    Existing fields kept for backwards compatibility.
+    We mainly care about price_band, but we forward gender/region/raw as hints.
     """
     gender: Optional[str] = None          # "male" | "female" | "unisex"
     region: Optional[str] = None          # "pakistan", "gulf", "europe", ...
     price_band: Optional[str] = None      # "0-100", "100-200", "200+"
-    scent_tag: Optional[str] = None       # NEW – canonical scent tag
-    setting_tag: Optional[str] = None     # NEW – canonical setting tag
     raw: Optional[Dict[str, Any]] = None  # any extra future stuff
 
 
@@ -96,8 +91,6 @@ class HealthResponse(BaseModel):
     model: str
 
 
-BACKEND_VERSION = "5.0.0-tags-aware"
-
 # ---------- Supabase catalog loading (cached) ----------
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -121,8 +114,7 @@ def load_catalog_from_supabase() -> List[Dict[str, Any]]:
       - price_band (text, nullable)   e.g. "0-100", "100-200", "200+"
       - price (numeric/text, nullable)
       - notes_top / notes_heart / notes_base (text[] or string, nullable)
-      - scent_tags / setting_tags (text[] or string, nullable)
-      - gender (text, nullable)
+      - projection / longevity / celebrity_endorsers (optional)
     """
     global _catalog_cache
 
@@ -170,6 +162,7 @@ def load_catalog_from_supabase() -> List[Dict[str, Any]]:
         print("❌ Error loading perfumes from Supabase:", repr(e))
         return []
 
+
 # ---------- Utility helpers ----------
 
 def trimmed_or_none(value: Optional[str]) -> Optional[str]:
@@ -177,55 +170,6 @@ def trimmed_or_none(value: Optional[str]) -> Optional[str]:
         return None
     v = value.strip()
     return v or None
-
-
-def normalize_tag_list(value: Any) -> List[str]:
-    """
-    Normalize DB scent_tags / setting_tags fields into a lowercase list.
-
-    Handles:
-    - NULL / None → []
-    - text[] from Postgres (already a Python list)
-    - comma-separated string "Fresh, Clean"
-    - pipe-separated string "Fresh|Clean"
-    """
-    if value is None:
-        return []
-    if isinstance(value, list):
-        raw_items = value
-    else:
-        # coerce to string and split on comma / pipe
-        s = str(value)
-        # allow both "," and "|" as separators
-        parts = []
-        for chunk in s.replace("|", ",").split(","):
-            chunk = chunk.strip()
-            if chunk:
-                parts.append(chunk)
-        raw_items = parts
-
-    result: List[str] = []
-    for item in raw_items:
-        t = str(item).strip().lower()
-        if t and t not in result:
-            result.append(t)
-    return result
-
-
-def normalize_gender(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    g = str(value).strip().lower()
-    if not g:
-        return None
-    # normalize common variants
-    if g.startswith("m"):
-        return "male"
-    if g.startswith("f"):
-        return "female"
-    if "unisex" in g or "uni" in g:
-        return "unisex"
-    return g
 
 
 def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
@@ -256,52 +200,10 @@ def resolve_price_band(filters: Optional[RecommendFilters]) -> Optional[str]:
     return None
 
 
-def extract_numeric_price(row: Dict[str, Any]) -> Optional[float]:
-    """Try to parse a numeric 'price' from the row, if present."""
-    price = row.get("price")
-    if price is None:
-        return None
-    try:
-        return float(price)
-    except Exception:
-        try:
-            return float(str(price).replace("$", "").strip())
-        except Exception:
-            return None
-
-
-def price_band_matches(row: Dict[str, Any], band: Optional[str]) -> bool:
-    """
-    Check if a row matches the requested price band.
-
-    Strategy:
-    - If numeric price available:
-        "0-100": 0 .. 110
-        "100-200": 90 .. 220
-        "200+": 180 .. +inf
-    - Else fallback to equality on row["price_band"].
-    """
-    if band is None:
-        return True
-
-    price_val = extract_numeric_price(row)
-    if price_val is not None:
-        if band == "0-100":
-            return 0 <= price_val <= 110.0
-        if band == "100-200":
-            return 90.0 <= price_val <= 220.0
-        if band == "200+":
-            return price_val >= 180.0
-
-    # fallback: use text band
-    row_band = (row.get("price_band") or "").strip().lower()
-    return row_band == band
-
-
 def build_system_prompt() -> str:
     """
     System prompt for RANKING:
-    - Model sees a candidate list with INDEXES + scent_tags/setting_tags/gender.
+    - Model sees a candidate list with INDEXES.
     - It must output JSON with candidate_index, reason, match_score, notes.
     """
     return (
@@ -310,26 +212,25 @@ def build_system_prompt() -> str:
         "You are given:\n"
         " - A natural language GOAL.\n"
         " - A PROFILE (likes / dislikes / owned / wishlist).\n"
-        " - Optional FILTERS (region, gender, price_band, scent_tag, setting_tag).\n"
+        " - Optional FILTERS (region, gender, price_band).\n"
         " - A CANDIDATE LIST of perfumes from the catalog, each with an INDEX.\n"
         "\n"
         "Your job:\n"
         " - RANK the candidates for how well they fit the GOAL and PROFILE.\n"
         " - You MUST ONLY choose perfumes from the candidate list.\n"
         " - Refer to perfumes by their integer candidate_index.\n"
-        " - Respect price_band as much as possible (candidates are already pre-filtered).\n"
-        " - If FILTERS specify scent_tag / setting_tag, pay close attention to matching those tags.\n"
+        " - Respect price_band as much as possible (candidates are already filtered).\n"
         " - If PROFILE shows strong likes (e.g. vanilla, oud, floral), bias toward matching notes.\n"
         " - If PROFILE shows dislikes, avoid them.\n"
         " - Avoid recommending things the user already OWNS unless there are not enough new options.\n"
         " - Vary your top picks when the GOAL clearly changes (different vibe / setting / budget).\n"
         "\n"
         "Occasion hints:\n"
-        " - \"work\" / \"office\" → clean, non-offensive, moderate projection.\n"
+        " - \"office\" → clean, non-offensive, moderate projection.\n"
         " - \"gym\" → very fresh, light, not cloying.\n"
-        " - \"night out\" / \"clubbing\" → louder, sexy, attention-grabbing.\n"
+        " - \"clubbing\" → louder, sexy, attention-grabbing.\n"
         " - \"date night\" → intimate, attractive, usually sweeter.\n"
-        " - \"special event\" / \"weddings\" → elegant, long-lasting, signature-worthy.\n"
+        " - \"special event\" / \"wedding\" → elegant, long-lasting, signature-worthy.\n"
         "\n"
         "VERY IMPORTANT RESPONSE FORMAT:\n"
         " - You MUST answer with ONLY valid, minified JSON.\n"
@@ -361,8 +262,7 @@ def build_system_prompt() -> str:
 
 def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
     """
-    Turn a Supabase row into a compact summary line for the LLM,
-    including scent_tags, setting_tags, gender.
+    Turn a Supabase row into a compact summary line for the LLM.
     """
     name = (row.get("name") or "").strip()
     brand = (row.get("brand") or "Unknown").strip()
@@ -371,22 +271,13 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
     price = row.get("price")
     projection = (row.get("projection") or "").strip() or "unknown"
     longevity = (row.get("longevity") or "").strip() or "unknown"
-    gender = normalize_gender(row.get("gender")) or "unspecified"
 
-    scent_tags = normalize_tag_list(row.get("scent_tags"))
-    setting_tags = normalize_tag_list(row.get("setting_tags"))
-
-    scent_str = ", ".join(scent_tags) if scent_tags else ""
-    setting_str = ", ".join(setting_tags) if setting_tags else ""
-
-    # notes may be arrays or comma-separated strings; normalize to comma string
     def normalize_notes(field: str) -> List[str]:
         v = row.get(field)
         if v is None:
             return []
         if isinstance(v, list):
             return [str(x).strip() for x in v if str(x).strip()]
-        # treat as string
         parts = str(v).split(",")
         return [p.strip() for p in parts if p.strip()]
 
@@ -406,14 +297,9 @@ def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
     parts = [
         f"[{idx}] {name} by {brand}",
         price_part,
-        f"gender: {gender}",
         f"projection: {projection}",
         f"longevity: {longevity}",
     ]
-    if scent_str:
-        parts.append(f"scent_tags: {scent_str}")
-    if setting_str:
-        parts.append(f"setting_tags: {setting_str}")
     if notes_str:
         parts.append(f"notes: {notes_str}")
     if description:
@@ -426,17 +312,23 @@ def build_user_prompt(req: RecommendRequest, candidates: List[Dict[str, Any]]) -
     """
     User prompt that includes GOAL, PROFILE, FILTERS and the CANDIDATE LIST.
     """
+
+    prefs = req.prefs
+    likes = prefs.likes or []
+    dislikes = prefs.dislikes or []
+    owned = prefs.owned or []
+    wishlist = prefs.wishlist or []
+
     parts: List[str] = []
 
     parts.append(f"GOAL: {req.goal.strip()}")
 
-    prefs = req.prefs
     parts.append(
         "PROFILE:\n"
-        f"  likes: {prefs.likes}\n"
-        f"  dislikes: {prefs.dislikes}\n"
-        f"  owned: {prefs.owned}\n"
-        f"  wishlist: {prefs.wishlist}"
+        f"  likes: {likes}\n"
+        f"  dislikes: {dislikes}\n"
+        f"  owned: {owned}\n"
+        f"  wishlist: {wishlist}"
     )
 
     if req.filters:
@@ -446,20 +338,10 @@ def build_user_prompt(req: RecommendRequest, candidates: List[Dict[str, Any]]) -
             f"  gender: {f.gender}\n"
             f"  region: {f.region}\n"
             f"  price_band: {f.price_band}\n"
-            f"  scent_tag: {f.scent_tag}\n"
-            f"  setting_tag: {f.setting_tag}\n"
             f"  raw: {f.raw}"
         )
     else:
-        parts.append(
-            "FILTERS:\n"
-            "  gender: null\n"
-            "  region: null\n"
-            "  price_band: null\n"
-            "  scent_tag: null\n"
-            "  setting_tag: null\n"
-            "  raw: null"
-        )
+        parts.append("FILTERS:\n  gender: null\n  region: null\n  price_band: null\n  raw: null")
 
     parts.append(f"MAX_RESULTS: {req.max_results}")
 
@@ -480,111 +362,34 @@ def filter_candidates_for_request(
     max_candidates: int = 60,
 ) -> List[Dict[str, Any]]:
     """
-    Filter candidates for a given request.
-
-    Hard-ish rules:
-    - Scent tag: if provided, require scent_tags contain it (case-insensitive).
-      If 0 matches, we gracefully relax this in a second pass.
-    - Price band: if provided, enforce via numeric price (with ~10% tolerance),
-      or fallback to text price_band.
-    - Gender: if provided, require gender match OR 'unisex' OR missing.
-
-    Setting tag:
-    - Strong preference. We try to keep only matching rows if there are enough;
-      otherwise we keep all that pass scent+price+gender and let the LLM bias.
+    Filter by price_band and optionally sample / truncate to a manageable size.
     """
     if not catalog:
         return []
 
-    filters = req.filters
-    resolved_band = resolve_price_band(filters)
+    resolved_band = resolve_price_band(req.filters)
+    filtered = catalog
 
-    requested_scent = None
-    requested_setting = None
-    requested_gender = None
+    if resolved_band:
+        def match_band(row: Dict[str, Any]) -> bool:
+            rb = (row.get("price_band") or "").strip()
+            return rb == resolved_band
 
-    if filters:
-        if filters.scent_tag:
-            requested_scent = filters.scent_tag.strip().lower()
-        if filters.setting_tag:
-            requested_setting = filters.setting_tag.strip().lower()
-        if filters.gender:
-            requested_gender = normalize_gender(filters.gender)
+        band_matches = [r for r in catalog if match_band(r)]
+        if band_matches:
+            filtered = band_matches
+        else:
+            print(
+                f"⚠️ No perfumes matched price_band='{resolved_band}' in Supabase; "
+                f"falling back to full catalog of {len(catalog)} perfumes."
+            )
 
-        # allow fallback from raw if iOS stuffs tags there
-        if not requested_scent and filters.raw and "scent_tag" in filters.raw:
-            requested_scent = str(filters.raw["scent_tag"]).strip().lower()
-        if not requested_setting and filters.raw and "setting_tag" in filters.raw:
-            requested_setting = str(filters.raw["setting_tag"]).strip().lower()
-
-    # 1) Hard filter on price band + gender + scent, if provided
-    def base_match(row: Dict[str, Any]) -> bool:
-        # price band
-        if resolved_band and not price_band_matches(row, resolved_band):
-            return False
-
-        # gender
-        if requested_gender:
-            row_gender = normalize_gender(row.get("gender"))
-            # allow unisex or missing as neutral
-            if row_gender not in (None, "unisex", requested_gender):
-                return False
-
-        # scent tag
-        if requested_scent:
-            row_scents = normalize_tag_list(row.get("scent_tags"))
-            if requested_scent not in row_scents:
-                return False
-
-        return True
-
-    base_filtered = [r for r in catalog if base_match(r)]
-
-    # If scent filtering killed everything, relax scent (keep price+gender)
-    if requested_scent and not base_filtered:
-        print(
-            f"⚠️ No perfumes matched scent_tag='{requested_scent}' "
-            f"with price_band='{resolved_band}' and gender='{requested_gender}'. "
-            "Relaxing scent_tag constraint (keeping price+gender)."
-        )
-
-        def price_gender_match(row: Dict[str, Any]) -> bool:
-            if resolved_band and not price_band_matches(row, resolved_band):
-                return False
-            if requested_gender:
-                row_gender = normalize_gender(row.get("gender"))
-                if row_gender not in (None, "unisex", requested_gender):
-                    return False
-            return True
-
-        base_filtered = [r for r in catalog if price_gender_match(r)]
-
-    # 2) Apply setting_tag as a strong preference
-    preferred: List[Dict[str, Any]] = base_filtered
-    if requested_setting and base_filtered:
-        with_setting = []
-        for row in base_filtered:
-            row_settings = normalize_tag_list(row.get("setting_tags"))
-            if requested_setting in row_settings:
-                with_setting.append(row)
-
-        # Only restrict if we still keep a decent number of candidates
-        if with_setting:
-            preferred = with_setting
-
-    filtered = preferred
-
-    # Truncate to max_candidates to keep prompts small (TikTok-style pre-candidates)
     if len(filtered) > max_candidates:
         filtered = filtered[:max_candidates]
 
     print(
         f"🧪 Candidate selection: {len(filtered)} perfumes after filters "
-        f"(price_band={resolved_band or 'any'}, "
-        f"scent_tag={requested_scent or 'any'}, "
-        f"setting_tag={requested_setting or 'any'}, "
-        f"gender={requested_gender or 'any'}, "
-        f"total_catalog={len(catalog)})"
+        f"(price_band={resolved_band or 'any'}, total_catalog={len(catalog)})"
     )
 
     return filtered
@@ -630,7 +435,6 @@ def build_simple_fallback_items(goal: str) -> List[RecommendItem]:
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    # Quick catalog check
     catalog = load_catalog_from_supabase()
     status = "healthy-with-catalog" if catalog else "healthy-no-catalog"
     return HealthResponse(
@@ -646,7 +450,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     """
     Main recommendation endpoint called by the iOS app.
     - Loads Supabase catalog
-    - Filters candidates by price_band + scent_tag + gender (+ setting preference)
+    - Filters candidates by price_band
     - Asks OpenAI to RANK by candidate_index
     - Maps back to real perfumes and returns top N
     """
@@ -654,20 +458,25 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     if not goal:
         raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
+    # Normalize prefs so downstream code always sees lists
+    likes = req.prefs.likes or []
+    dislikes = req.prefs.dislikes or []
+    owned = req.prefs.owned or []
+    wishlist = req.prefs.wishlist or []
+
     # 1) Load catalog
     catalog_all = load_catalog_from_supabase()
 
-    # If catalog is completely empty, skip ranking and use simple fallback.
     if not catalog_all:
         print("⚠️ Catalog empty or Supabase not configured — returning simple fallback recommendations.")
         fallback_items = build_simple_fallback_items(goal)
         return RecommendResponse(
             items=fallback_items,
             used_profile=UsedProfile(
-                likes=req.prefs.likes,
-                dislikes=req.prefs.dislikes,
-                owned=req.prefs.owned,
-                wishlist=req.prefs.wishlist,
+                likes=likes,
+                dislikes=dislikes,
+                owned=owned,
+                wishlist=wishlist,
             ),
             request_id="fallback-no-catalog",
         )
@@ -675,10 +484,9 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
     # 2) Build candidate list for this request
     candidates = filter_candidates_for_request(catalog_all, req)
 
-    # If somehow no candidates after filtering, fall back to whole catalog (defensive)
     if not candidates:
         print("⚠️ No candidates after filtering, falling back to full catalog for ranking.")
-        candidates = catalog_all[:60]  # cap
+        candidates = catalog_all[:60]  # defensive cap
 
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(req, candidates)
@@ -701,7 +509,10 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         choice = completion.choices[0]
         raw_json = choice.message.content
 
-        print(f"🌐 /recommend status: 200, latency={latency_ms}ms, candidates={len(candidates)}")
+        print(
+            f"🌐 /recommend status: 200, latency={latency_ms}ms, "
+            f"candidates={len(candidates)}"
+        )
 
         # Parse JSON from the model
         try:
@@ -712,21 +523,21 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
             return RecommendResponse(
                 items=fallback_items,
                 used_profile=UsedProfile(
-                    likes=req.prefs.likes,
-                    dislikes=req.prefs.dislikes,
-                    owned=req.prefs.owned,
-                    wishlist=req.prefs.wishlist,
+                    likes=likes,
+                    dislikes=dislikes,
+                    owned=owned,
+                    wishlist=wishlist,
                 ),
                 request_id=f"fallback-decode-error-{completion.id}",
             )
 
         # used_profile from model (or default)
-        used_profile = data.get("used_profile") or {}
-        used_profile_obj = UsedProfile(
-            likes=used_profile.get("likes") or req.prefs.likes,
-            dislikes=used_profile.get("dislikes") or req.prefs.dislikes,
-            owned=used_profile.get("owned") or req.prefs.owned,
-            wishlist=used_profile.get("wishlist") or req.prefs.wishlist,
+        used_profile_data = data.get("used_profile") or {}
+        used_profile = UsedProfile(
+            likes=used_profile_data.get("likes") or likes,
+            dislikes=used_profile_data.get("dislikes") or dislikes,
+            owned=used_profile_data.get("owned") or owned,
+            wishlist=used_profile_data.get("wishlist") or wishlist,
         )
 
         # items from model: candidate_index + reason + score + notes
@@ -734,7 +545,6 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         cleaned_items: List[RecommendItem] = []
 
         for raw_item in items_data:
-            # robustly get candidate_index
             idx = raw_item.get("candidate_index")
             try:
                 idx_int = int(idx)
@@ -766,12 +576,10 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
                 )
             )
 
-        # If the model gave us no usable items, use simple fallback.
         if not cleaned_items:
             print("⚠️ Model returned empty/invalid ranked items — using simple fallback recommendations.")
             cleaned_items = build_simple_fallback_items(goal)
 
-        # Trim to max_results
         max_results = max(1, req.max_results)
         cleaned_items = cleaned_items[:max_results]
 
@@ -779,7 +587,7 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
 
         return RecommendResponse(
             items=cleaned_items,
-            used_profile=used_profile_obj,
+            used_profile=used_profile,
             request_id=request_id,
         )
 
@@ -791,13 +599,12 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         return RecommendResponse(
             items=fallback_items,
             used_profile=UsedProfile(
-                likes=req.prefs.likes,
-                dislikes=req.prefs.dislikes,
-                owned=req.prefs.owned,
-                wishlist=req.prefs.wishlist,
+                likes=likes,
+                dislikes=dislikes,
+                owned=owned,
+                wishlist=wishlist,
             ),
             request_id="fallback-internal-error",
         )
-
 
 
