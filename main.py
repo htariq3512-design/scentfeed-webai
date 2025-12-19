@@ -1,37 +1,40 @@
 # main.py
 #
-# ScentFeed Web AI backend (TikTok/Meta-style ranker)
+# ScentFeed Web AI backend (Supabase catalog + TikTok/Meta-style retrieval + LLM rerank)
 #
-# - Loads perfumes from Supabase `perfumes` table
-# - Strictly filters by scent + price band when possible
-# - Can flex price by ~20% if needed to reach 3 candidates
-# - Uses OpenAI to RANK a candidate list by index
-# - ALWAYS returns catalog-based perfumes (no hardcoded Dior/Chanel fallback)
+# ONLINE LOGIC:
+# - Always uses Supabase catalog (no hardcoded perfume fallbacks)
+# - Strict scent match (if provided)
+# - Strict price band first; if < N, relax ~20%; if still < N, closest-price fill
+# - Pre-rank candidates using your CSV scores (hype/mass/vers) + profile taste
+# - Ask OpenAI to rank by candidate_index (no name mismatch)
+#
+# If Supabase or OpenAI fails → return error (iOS will fallback to offline CSV).
+#
+from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from pydantic.config import ConfigDict
 from typing import List, Optional, Dict, Any, Tuple
 import os
 import time
 import json
 import threading
+import random
 
 import requests
 from openai import OpenAI
 
-# ---------- OpenAI client ----------
 
+# ---------- OpenAI client ----------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ---------- FastAPI app ----------
-
-BACKEND_VERSION = "4.2.0-ranked-scoring"
-
-app = FastAPI(title="ScentFeed Web AI", version=BACKEND_VERSION)
-
-# ---------- Pydantic models (wire contract with the iOS app) ----------
+app = FastAPI(title="ScentFeed Web AI", version="5.0.0-online-rerank")
 
 
+# ---------- Models ----------
 class Prefs(BaseModel):
     likes: List[str] = Field(default_factory=list)
     dislikes: List[str] = Field(default_factory=list)
@@ -39,19 +42,40 @@ class Prefs(BaseModel):
     wishlist: List[str] = Field(default_factory=list)
 
 
+class RecommendFilters(BaseModel):
+    gender: Optional[str] = None
+    region: Optional[str] = None
+    price_band: Optional[str] = None  # "0-100" | "100-200" | "200+"
+    raw: Optional[Dict[str, Any]] = None
+
+
 class RecommendRequest(BaseModel):
     """
-    Flexible filters: we accept any shape here as a dict to avoid 422s
-    when the iOS side sends extra keys.
+    Backwards compatible request:
+    Supports BOTH:
+      - old shape: { goal, max_results, prefs, filters }
+      - new shape: { goal, max_results, selected_scent, selected_setting, price_band, gender, likes, dislikes, owned, wishlist }
     """
+    model_config = ConfigDict(extra="allow")  # accept unknown keys to avoid 422
+
     uid: Optional[str] = None
     goal: str
     max_results: int = 3
-    prefs: Prefs
-    filters: Optional[Dict[str, Any]] = None
 
-    class Config:
-        extra = "allow"
+    # Old shape
+    prefs: Optional[Prefs] = None
+    filters: Optional[RecommendFilters] = None
+
+    # New/flat shape (Swift-friendly)
+    selected_scent: Optional[str] = None
+    selected_setting: Optional[str] = None
+    price_band: Optional[str] = None
+    gender: Optional[str] = None
+
+    likes: List[str] = Field(default_factory=list)
+    dislikes: List[str] = Field(default_factory=list)
+    owned: List[str] = Field(default_factory=list)
+    wishlist: List[str] = Field(default_factory=list)
 
 
 class RecommendItem(BaseModel):
@@ -81,8 +105,10 @@ class HealthResponse(BaseModel):
     model: str
 
 
-# ---------- Supabase catalog loading (cached) ----------
+BACKEND_VERSION = "5.0.0-online-rerank"
 
+
+# ---------- Supabase loading (cached) ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = (
     os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -95,23 +121,10 @@ _CATALOG_TTL_SECONDS = 300  # 5 minutes
 
 
 def load_catalog_from_supabase() -> List[Dict[str, Any]]:
-    """
-    Fetch all rows from public.perfumes via Supabase REST.
-    Expected fields (loose):
-      - name (text)
-      - brand (text)
-      - description (text, nullable)
-      - price_band (text, nullable)   e.g. "0-100", "100-200", "200+"
-      - price (numeric/text, nullable)
-      - notes_top / notes_heart / notes_base (text[] or string, nullable)
-      - projection / longevity / celebrity_endorsers (optional)
-      - scent_tags / setting_tags / gender (string or string[])
-    """
     global _catalog_cache
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        print("⚠️ Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing).")
-        return []
+        raise RuntimeError("Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing).")
 
     now = time.time()
     with _catalog_lock:
@@ -128,619 +141,666 @@ def load_catalog_from_supabase() -> List[Dict[str, Any]]:
     }
     params = {"select": "*"}
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-        if not isinstance(raw, list):
-            print("⚠️ Unexpected Supabase response shape for perfumes:", type(raw))
-            return []
+    resp = requests.get(url, headers=headers, params=params, timeout=12)
+    resp.raise_for_status()
+    raw = resp.json()
+    if not isinstance(raw, list):
+        raise RuntimeError(f"Unexpected Supabase response shape: {type(raw)}")
 
-        items: List[Dict[str, Any]] = []
-        for row in raw:
-            try:
-                name = (row.get("name") or "").strip()
-                if not name:
-                    continue
-                items.append(row)
-            except Exception as e:
-                print("⚠️ Failed to parse perfume row from Supabase:", e, "row=", row)
+    items: List[Dict[str, Any]] = []
+    for row in raw:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        items.append(row)
 
-        with _catalog_lock:
-            _catalog_cache = (now, items)
-        print(f"✅ Loaded {len(items)} perfumes from Supabase catalog.")
-        return items
-    except Exception as e:
-        print("❌ Error loading perfumes from Supabase:", repr(e))
-        return []
+    with _catalog_lock:
+        _catalog_cache = (now, items)
+
+    return items
 
 
-# ---------- Utility helpers ----------
-
-def trimmed_or_none(value: Optional[str]) -> Optional[str]:
-    if value is None:
+# ---------- Normalization helpers ----------
+def norm(s: Optional[str]) -> Optional[str]:
+    if s is None:
         return None
-    v = value.strip()
-    return v or None
+    t = str(s).strip().lower()
+    return t or None
 
 
-def parse_structured_goal(goal: str) -> Dict[str, Optional[str]]:
+def split_tags(value: Any) -> List[str]:
     """
-    Parse goal strings like:
-      "scent: fresh | setting: every day | budget: 0-100"
-    into:
-      {"scent": "fresh", "setting": "every day", "price_band": "0-100"}
-    """
-    result: Dict[str, Optional[str]] = {
-        "scent": None,
-        "setting": None,
-        "price_band": None,
-    }
-    parts = [p.strip() for p in goal.split("|")]
-    for part in parts:
-        lower = part.lower()
-        if lower.startswith("scent:"):
-            result["scent"] = part.split(":", 1)[1].strip().lower()
-        elif lower.startswith("setting:"):
-            result["setting"] = part.split(":", 1)[1].strip().lower()
-        elif lower.startswith("budget:") or lower.startswith("price:"):
-            result["price_band"] = part.split(":", 1)[1].strip().lower()
-    return result
-
-
-def parse_tags(value: Any) -> List[str]:
-    """
-    Normalize scent_tags / setting_tags / gender-like fields into a list[str] (lowercased).
-    Can handle:
-      - null
-      - ["Fresh", "Citrus"]
-      - "Fresh, Citrus"
+    Accept:
+      - list[str]
+      - comma-separated string
+      - None
     """
     if value is None:
         return []
     if isinstance(value, list):
-        return [str(x).strip().lower() for x in value if str(x).strip()]
-    # treat as comma-separated string
-    return [t.strip().lower() for t in str(value).split(",") if t.strip()]
+        out = []
+        for x in value:
+            tx = norm(x)
+            if tx:
+                out.append(tx)
+        return out
+    s = str(value)
+    parts = [p.strip().lower() for p in s.split(",")]
+    return [p for p in parts if p]
 
 
-def resolve_price_band(filters: Optional[Dict[str, Any]], parsed_goal_band: Optional[str]) -> Optional[str]:
-    """
-    Normalize price bands between frontend naming and DB values.
-    We expect DB price_band values like: "0-100", "100-200", "200+".
-    Prefer explicit filters, then parsed goal.
-    """
-    band = None
-    if filters:
-        # Support both snake_case and camelCase keys
-        band = (
-            filters.get("price_band")
-            or filters.get("priceBand")
-            or filters.get("budget")
-        )
-    if not band and parsed_goal_band:
-        band = parsed_goal_band
-
-    if not band:
+def safe_float(v: Any) -> Optional[float]:
+    if v is None:
         return None
-
-    pb = str(band).strip().lower()
-
-    if pb in ("0-100", "0 – 100", "0 — 100", "0_to_100", "0_100", "0 –100"):
-        return "0-100"
-    if pb in ("100-200", "100 – 200", "100 — 200", "100_to_200", "100_200"):
-        return "100-200"
-    if pb in ("200+", "200_plus", "200 – up", "200+ "):
-        return "200+"
-
-    # fallback: rough mapping
-    if "0" in pb and "100" in pb:
-        return "0-100"
-    if "100" in pb and "200" in pb:
-        return "100-200"
-    if "200" in pb or "+" in pb or "plus" in pb:
-        return "200+"
-
-    return None
-
-
-def flexible_price_range(resolved_band: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """
-    20% flex around band boundaries.
-    - "0-100"   → 0 .. 120, target_mid ~ 50
-    - "100-200" → 80 .. 240, target_mid ~ 150
-    - "200+"    → 160 .. None, target_mid ~ 250
-    Returns (lo, hi, target_mid)
-    """
-    if resolved_band == "0-100":
-        return 0.0, 120.0, 50.0
-    if resolved_band == "100-200":
-        return 80.0, 240.0, 150.0
-    if resolved_band == "200+":
-        return 160.0, None, 250.0
-    return None, None, None
-
-
-def to_float_or_none(v: Any) -> Optional[float]:
     try:
-        if v is None:
-            return None
         return float(v)
     except Exception:
         return None
 
 
-def build_system_prompt() -> str:
+def clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        v = int(x)
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
+
+
+# ---------- Request unification ----------
+def unify_request(req: RecommendRequest) -> Dict[str, Any]:
+    # Profile lists
+    likes = req.likes[:] if req.likes else []
+    dislikes = req.dislikes[:] if req.dislikes else []
+    owned = req.owned[:] if req.owned else []
+    wishlist = req.wishlist[:] if req.wishlist else []
+
+    # If old prefs exists, merge them in (avoid breaking older clients)
+    if req.prefs:
+        likes = (req.prefs.likes or []) + likes
+        dislikes = (req.prefs.dislikes or []) + dislikes
+        owned = (req.prefs.owned or []) + owned
+        wishlist = (req.prefs.wishlist or []) + wishlist
+
+    # Filters / selected fields
+    selected_scent = req.selected_scent
+    selected_setting = req.selected_setting
+    price_band = req.price_band
+    gender = req.gender
+
+    if req.filters:
+        if not gender:
+            gender = req.filters.gender
+        if not price_band:
+            price_band = req.filters.price_band
+
+    return {
+        "goal": req.goal.strip(),
+        "max_results": max(1, int(req.max_results)),
+        "selected_scent": norm(selected_scent),
+        "selected_setting": norm(selected_setting),
+        "price_band": resolve_price_band(price_band),
+        "gender": norm(gender),
+        "profile": {
+            "likes": dedupe_list(likes),
+            "dislikes": dedupe_list(dislikes),
+            "owned": dedupe_list(owned),
+            "wishlist": dedupe_list(wishlist),
+        },
+    }
+
+
+def dedupe_list(xs: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in xs:
+        t = (x or "").strip()
+        if not t:
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def resolve_price_band(pb: Optional[str]) -> Optional[str]:
+    if not pb:
+        return None
+    p = pb.strip().lower()
+
+    if p in ("0-100", "0 – 100", "0—100", "0_to_100", "0_100", "under100", "under 100"):
+        return "0-100"
+    if p in ("100-200", "100 – 200", "100—200", "100_to_200", "100_200"):
+        return "100-200"
+    if p in ("200+", "200_plus", "200 plus", "over200", "over 200", "200 and up"):
+        return "200+"
+
+    if "0" in p and "100" in p:
+        return "0-100"
+    if "100" in p and "200" in p:
+        return "100-200"
+    if "200" in p or "+" in p or "plus" in p:
+        return "200+"
+
+    return None
+
+
+# ---------- Price band logic ----------
+def price_strict_range(band: str) -> Tuple[float, Optional[float]]:
+    if band == "0-100":
+        return (0.0, 100.0)
+    if band == "100-200":
+        return (100.0, 200.0)
+    if band == "200+":
+        return (200.0, None)
+    return (0.0, None)
+
+
+def price_relaxed_range(band: str) -> Tuple[float, Optional[float]]:
+    # ~20% variance
+    if band == "0-100":
+        return (0.0, 120.0)
+    if band == "100-200":
+        return (80.0, 240.0)
+    if band == "200+":
+        return (160.0, None)
+    return (0.0, None)
+
+
+def in_price_range(price: Optional[float], r: Tuple[float, Optional[float]]) -> bool:
+    if price is None:
+        return False
+    lo, hi = r
+    if hi is None:
+        return price >= lo
+    return lo <= price <= hi
+
+
+def price_target(band: str) -> float:
+    if band == "0-100":
+        return 75.0
+    if band == "100-200":
+        return 150.0
+    if band == "200+":
+        return 250.0
+    return 150.0
+
+
+# ---------- Setting intent weights ----------
+def setting_intent_weights(setting: Optional[str]) -> Tuple[float, float, float]:
     """
-    System prompt for RANKING:
-    - Model sees a candidate list with INDEXES.
-    - It must output JSON with candidate_index, reason, match_score, notes.
-    - We embed our scoring preferences here.
+    Returns (hype_w, mass_w, vers_w) based on setting intent.
+    Mirrors your offline logic.
     """
-    return (
-        "You are ScentFeed, a professional perfume recommendation engine used in a mobile app.\n"
-        "\n"
-        "You are given:\n"
-        " - A natural language GOAL which may encode SCENT, SETTING and BUDGET.\n"
-        " - A structured SUMMARY of the parsed SCENT / SETTING / PRICE_BAND.\n"
-        " - A PROFILE (likes / dislikes / owned / wishlist).\n"
-        " - Optional FILTERS (gender, region, raw JSON).\n"
-        " - A CANDIDATE LIST of perfumes from the catalog, each with an integer INDEX.\n"
-        "\n"
-        "Your job:\n"
-        " - RANK the candidates for how well they fit the GOAL and PROFILE.\n"
-        " - You MUST ONLY choose perfumes from the candidate list (by candidate_index).\n"
-        " - Always try to return up to 3 items.\n"
-        "\n"
-        "SCORING PRIORITIES (think in a rough numeric way):\n"
-        " 1) SCENT is most important (like +40 points if the scent family matches what the user asked for).\n"
-        " 2) PRICE is also very important:\n"
-        "    - Prefer perfumes in the requested price_band exactly.\n"
-        "    - If there are not enough in that band, you may include perfumes within roughly 20% of the price range.\n"
-        "    - When you step outside the strict band, mention that briefly in the reason.\n"
-        " 3) SETTING is helpful but secondary:\n"
-        "    - If setting tags match the chosen setting (e.g. 'Work', 'Every Day', 'Date Night', 'Night Out', 'Summer', 'Gym', etc.), treat that like +10–15 points.\n"
-        "    - If setting is adjacent (e.g. 'Night Out' vs 'Date Night', 'Work' vs 'Every Day'), give a smaller bonus.\n"
-        " 4) PROFILE PERSONALIZATION:\n"
-        "    - If the perfume name appears in likes, boost strongly (like +25 points).\n"
-        "    - If the brand appears in likes or wishlist, small bonus (like +8 points).\n"
-        "    - If the perfume is in dislikes, strongly penalize (like -40 points).\n"
-        "    - If the brand is in dislikes, small penalty.\n"
-        "    - If the perfume is already owned, lightly down-rank (we still show it if options are limited).\n"
-        "    - If the perfume is in wishlist, boost.\n"
-        "\n"
-        "Occasion hints for SETTING:\n"
-        " - 'work' or 'office' → clean, non-offensive, moderate projection.\n"
-        " - 'gym' → very fresh, light, not cloying.\n"
-        " - 'night out' or 'clubbing' → louder, sexy, attention-grabbing.\n"
-        " - 'date night' → intimate, attractive, often sweeter or more sensual.\n"
-        " - 'summer' → airy, citrus, fresh, not heavy.\n"
-        " - 'winter' or 'cozy' → warmer, sweeter, heavier, more amber/vanilla/spice.\n"
-        "\n"
-        "DIVERSITY:\n"
-        " - When multiple candidates are very close in score, prefer variety in brands and note profiles instead of making all 3 nearly identical.\n"
-        "\n"
-        "VERY IMPORTANT RESPONSE FORMAT:\n"
-        " - You MUST answer with ONLY valid, minified JSON.\n"
-        " - No markdown, no explanations outside JSON.\n"
-        " - Schema:\n"
-        "   {\n"
-        "     \"items\": [\n"
-        "       {\n"
-        "         \"candidate_index\": 0,\n"
-        "         \"reason\": \"short explanation (1–2 sentences)\",\n"
-        "         \"match_score\": 0–100,\n"
-        "         \"notes\": \"optional, short comma-separated key notes\" or null\n"
-        "       },\n"
-        "       ... (up to 3 items)\n"
-        "     ],\n"
-        "     \"used_profile\": {\n"
-        "       \"likes\": [...],\n"
-        "       \"dislikes\": [...],\n"
-        "       \"owned\": [...],\n"
-        "       \"wishlist\": [...]\n"
-        "     },\n"
-        "     \"request_id\": \"string-id-for-debugging\"\n"
-        "   }\n"
-        "\n"
-        "The candidate_index MUST be a valid integer index from the CANDIDATE LIST.\n"
-        "Never include trailing commas. Never add comments. Only valid JSON.\n"
-    )
+    s = setting or ""
+    if "night" in s and "out" in s:
+        return (0.45, 0.25, 0.10)
+    if "date" in s:
+        return (0.25, 0.45, 0.15)
+    if "work" in s:
+        return (0.10, 0.25, 0.50)
+    if "every" in s:
+        return (0.15, 0.30, 0.45)
+    if "travel" in s:
+        return (0.15, 0.30, 0.50)
+    if "gym" in s:
+        return (0.05, 0.25, 0.50)
+    if "wedding" in s:
+        return (0.20, 0.40, 0.35)
+    if "summer" in s or "winter" in s or "fall" in s or "spring" in s:
+        return (0.15, 0.30, 0.35)
+    if "cozy" in s:
+        return (0.20, 0.35, 0.30)
+    return (0.20, 0.35, 0.35)
 
 
-def summarize_candidate(idx: int, row: Dict[str, Any]) -> str:
-    """
-    Turn a Supabase row into a compact summary line for the LLM.
-    """
-    name = (row.get("name") or "").strip()
-    brand = (row.get("brand") or "Unknown").strip()
-    description = (row.get("description") or "").strip()
-    price_band = (row.get("price_band") or "").strip() or "unknown"
-    price = row.get("price")
-    projection = (row.get("projection") or "").strip() or "unknown"
-    longevity = (row.get("longevity") or "").strip() or "unknown"
-    scent_tags = ", ".join(parse_tags(row.get("scent_tags")))
-    setting_tags = ", ".join(parse_tags(row.get("setting_tags")))
-    gender = ", ".join(parse_tags(row.get("gender")))
+# ---------- Candidate shaping ----------
+def row_to_features(row: Dict[str, Any]) -> Dict[str, Any]:
+    # Tags + notes
+    scent_tags = split_tags(row.get("scent_tags"))
+    setting_tags = split_tags(row.get("setting_tags"))
 
-    def normalize_notes(field: str) -> List[str]:
-        v = row.get(field)
-        if v is None:
-            return []
-        if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x).strip()]
-        # treat as string
-        parts = str(v).split(",")
-        return [p.strip() for p in parts if p.strip()]
+    notes_top = split_tags(row.get("notes_top"))
+    notes_heart = split_tags(row.get("notes_heart"))
+    notes_base = split_tags(row.get("notes_base"))
+    all_notes = list(dict.fromkeys(notes_top + notes_heart + notes_base))
 
-    notes_top = normalize_notes("notes_top")
-    notes_heart = normalize_notes("notes_heart")
-    notes_base = normalize_notes("notes_base")
-    all_notes: List[str] = []
-    for n in notes_top + notes_heart + notes_base:
-        if n not in all_notes:
-            all_notes.append(n)
-    notes_str = ", ".join(all_notes) if all_notes else ""
+    # Scores
+    hype = safe_float(row.get("hype_score")) or 50.0
+    mass = safe_float(row.get("mass_appeal_score")) or 50.0
+    vers = safe_float(row.get("versatility_score")) or 50.0
 
-    price_part = f"price_band: {price_band}"
-    if price is not None:
-        price_part += f", approx_price: {price}"
+    price = safe_float(row.get("price"))
 
-    parts = [
-        f"[{idx}] {name} by {brand}",
-        price_part,
-        f"projection: {projection}",
-        f"longevity: {longevity}",
-    ]
-    if gender:
-        parts.append(f"gender: {gender}")
-    if scent_tags:
-        parts.append(f"scent_tags: {scent_tags}")
-    if setting_tags:
-        parts.append(f"setting_tags: {setting_tags}")
-    if notes_str:
-        parts.append(f"notes: {notes_str}")
-    if description:
-        parts.append(f"desc: {description}")
-
-    return " | ".join(parts)
+    return {
+        "name": (row.get("name") or "").strip(),
+        "brand": (row.get("brand") or "Unknown").strip(),
+        "price": price,
+        "gender": norm(row.get("gender")),
+        "scent_tags": scent_tags,
+        "setting_tags": setting_tags,
+        "notes": all_notes,
+        "hype_score": hype,
+        "mass_appeal_score": mass,
+        "versatility_score": vers,
+        "projection": (row.get("projection") or "").strip() or None,
+        "longevity": (row.get("longevity") or "").strip() or None,
+        "description": (row.get("description") or "").strip() or None,
+    }
 
 
-def build_user_prompt(req: RecommendRequest, candidates: List[Dict[str, Any]]) -> str:
-    """
-    User prompt that includes GOAL, parsed SCENT/SETTING/PRICE, PROFILE, FILTERS and CANDIDATES.
-    """
-    parsed = parse_structured_goal(req.goal)
+def build_profile_signature(catalog_feats: List[Dict[str, Any]], profile: Dict[str, List[str]]) -> Dict[str, Any]:
+    # Build map by normalized name
+    by_name = {norm(f["name"]) or f["name"].lower(): f for f in catalog_feats}
 
-    parts: List[str] = []
+    likes = {norm(x) for x in profile.get("likes", []) if norm(x)}
+    dislikes = {norm(x) for x in profile.get("dislikes", []) if norm(x)}
 
-    parts.append(f"GOAL: {req.goal.strip()}")
+    liked_tags = set()
+    disliked_tags = set()
+    liked_notes = set()
+    disliked_notes = set()
 
-    parts.append(
-        "STRUCTURED_GOAL:\n"
-        f"  scent: {parsed.get('scent')}\n"
-        f"  setting: {parsed.get('setting')}\n"
-        f"  price_band: {parsed.get('price_band')}"
-    )
+    for n in likes:
+        f = by_name.get(n)
+        if not f:
+            continue
+        liked_tags.update(f["scent_tags"])
+        liked_tags.update(f["setting_tags"])
+        liked_notes.update(f["notes"])
 
-    prefs = req.prefs
-    parts.append(
-        "PROFILE:\n"
-        f"  likes: {prefs.likes}\n"
-        f"  dislikes: {prefs.dislikes}\n"
-        f"  owned: {prefs.owned}\n"
-        f"  wishlist: {prefs.wishlist}"
-    )
+    for n in dislikes:
+        f = by_name.get(n)
+        if not f:
+            continue
+        disliked_tags.update(f["scent_tags"])
+        disliked_tags.update(f["setting_tags"])
+        disliked_notes.update(f["notes"])
 
-    filters = req.filters or {}
-    parts.append("FILTERS_JSON:\n" + json.dumps(filters, ensure_ascii=False))
-
-    parts.append(f"MAX_RESULTS: {req.max_results}")
-
-    # Candidate list
-    lines = [summarize_candidate(i, row) for i, row in enumerate(candidates)]
-    catalog_block = "\n".join(lines)
-    parts.append(
-        "CANDIDATE LIST (you MUST only choose perfumes from this list using candidate_index):\n"
-        + catalog_block
-    )
-
-    return "\n\n".join(parts)
+    return {
+        "likes": list(likes),
+        "dislikes": list(dislikes),
+        "liked_tags": list(liked_tags),
+        "disliked_tags": list(disliked_tags),
+        "liked_notes": list(liked_notes),
+        "disliked_notes": list(disliked_notes),
+    }
 
 
-def filter_candidates_for_request(
-    catalog: List[Dict[str, Any]],
-    req: RecommendRequest,
-    max_candidates: int = 60,
+def overlap_ratio(a: List[str], bset: set) -> float:
+    if not a or not bset:
+        return 0.0
+    inter = sum(1 for x in a if x in bset)
+    denom = max(1, min(len(a), len(bset)))
+    return inter / float(denom)
+
+
+def price_tier_bonus(tier: str) -> float:
+    return {"strict": 0.60, "relaxed": 0.30, "closest": 0.10, "noprice": -0.15}.get(tier, 0.0)
+
+
+def pre_score_candidate(
+    feat: Dict[str, Any],
+    selected_setting: Optional[str],
+    band: Optional[str],
+    tier: str,
+    profile_sig: Dict[str, Any],
+) -> float:
+    s = 1.0
+    s += price_tier_bonus(tier)
+
+    # Setting soft boost
+    if selected_setting and selected_setting != "any":
+        if selected_setting in feat["setting_tags"]:
+            s += 0.25
+        else:
+            s -= 0.05
+
+    # Quality priors from your 3 scores (0..100)
+    hw, mw, vw = setting_intent_weights(selected_setting)
+    hype = max(0.0, min(1.0, (feat["hype_score"] / 100.0)))
+    mass = max(0.0, min(1.0, (feat["mass_appeal_score"] / 100.0)))
+    vers = max(0.0, min(1.0, (feat["versatility_score"] / 100.0)))
+    s += hype * hw + mass * mw + vers * vw
+
+    # Taste DNA overlap
+    liked_tags = set(profile_sig.get("liked_tags") or [])
+    disliked_tags = set(profile_sig.get("disliked_tags") or [])
+    liked_notes = set(profile_sig.get("liked_notes") or [])
+    disliked_notes = set(profile_sig.get("disliked_notes") or [])
+
+    tag_union = list(dict.fromkeys(feat["scent_tags"] + feat["setting_tags"]))
+    s += overlap_ratio(tag_union, liked_tags) * 0.35
+    s -= overlap_ratio(tag_union, disliked_tags) * 0.60
+    s += overlap_ratio(feat["notes"], liked_notes) * 0.35
+    s -= overlap_ratio(feat["notes"], disliked_notes) * 0.60
+
+    # Owned / wishlist / dislikes by name
+    nm = norm(feat["name"]) or ""
+    if nm and nm in set(profile_sig.get("disliked_names", []) or []):
+        s -= 1.0
+
+    return s
+
+
+def retrieve_candidates(
+    feats: List[Dict[str, Any]],
+    selected_scent: Optional[str],
+    selected_setting: Optional[str],
+    band: Optional[str],
+    gender: Optional[str],
+    max_results: int,
+    profile_sig: Dict[str, Any],
+    max_candidates: int = 80,
 ) -> List[Dict[str, Any]]:
-    """
-    Filter by:
-      - scent tag (strict)
-      - price_band (strict, then ~20% flex if < needed)
-      - gender (if provided)
-    Then truncate to max_candidates.
-    """
-    if not catalog:
-        return []
+    pool = feats
 
-    parsed = parse_structured_goal(req.goal)
-    target_scent = (parsed.get("scent") or "").lower().strip() or None
-    parsed_price_band = parsed.get("price_band")
-    filters = req.filters or {}
+    # Hard scent match if selected (100%)
+    if selected_scent and selected_scent not in ("any",):
+        pool = [f for f in pool if selected_scent in f["scent_tags"]]
+        if not pool:
+            return []
 
-    # gender filter (optional)
-    gender_filter = None
-    if "gender" in filters:
-        gender_filter = str(filters.get("gender") or "").lower().strip()
-    elif "selectedGender" in filters:
-        gender_filter = str(filters.get("selectedGender") or "").lower().strip()
+    # Gender soft filter (allow unisex)
+    if gender and gender not in ("any",):
+        filtered = []
+        for f in pool:
+            g = f.get("gender") or "unisex"
+            if gender == "unisex" or g == "unisex" or g == gender:
+                filtered.append(f)
+        if filtered:
+            pool = filtered
 
-    resolved_band = resolve_price_band(filters, parsed_price_band)
+    # Price staged retrieval
+    staged: List[Tuple[Dict[str, Any], str]] = []
 
-    # First pass: scent + gender filter only
-    def scent_gender_ok(row: Dict[str, Any]) -> bool:
-        if target_scent:
-            row_scent_tags = parse_tags(row.get("scent_tags"))
-            if target_scent not in row_scent_tags:
-                return False
+    if band:
+        strict_r = price_strict_range(band)
+        relaxed_r = price_relaxed_range(band)
 
-        if gender_filter:
-            row_gender_tags = parse_tags(row.get("gender"))
-            # keep if exact gender or unisex
-            if gender_filter not in row_gender_tags and "unisex" not in row_gender_tags:
-                return False
+        strict = []
+        relaxed = []
+        leftovers = []
+        no_price = []
 
-        return True
+        for f in pool:
+            price = f.get("price")
+            if price is None:
+                no_price.append(f)
+                continue
+            if in_price_range(price, strict_r):
+                strict.append(f)
+            elif in_price_range(price, relaxed_r):
+                relaxed.append(f)
+            else:
+                leftovers.append(f)
 
-    base_pool = [r for r in catalog if scent_gender_ok(r)]
+        # strict first
+        for f in strict:
+            staged.append((f, "strict"))
 
-    if not base_pool:
-        # No exact scent+gender matches -> as a last resort use full catalog
-        print(
-            f"⚠️ No perfumes matched scent={target_scent!r} and gender={gender_filter!r}; "
-            f"falling back to full catalog of {len(catalog)} perfumes."
-        )
-        base_pool = catalog[:]
+        # relaxed next (only if needed)
+        if len(staged) < max_candidates:
+            for f in relaxed:
+                staged.append((f, "relaxed"))
 
-    # Second pass: strict price_band filter within base_pool
-    strict_candidates: List[Dict[str, Any]] = []
-    if resolved_band:
-        for r in base_pool:
-            rb = (r.get("price_band") or "").strip()
-            if rb == resolved_band:
-                strict_candidates.append(r)
-    else:
-        strict_candidates = base_pool[:]
-
-    min_needed = max(3, req.max_results)
-
-    if len(strict_candidates) >= min_needed:
-        filtered = strict_candidates
-        price_flex_used = False
-    else:
-        # Not enough strict band matches → apply 20% flex on numeric price
-        lo, hi, target_mid = flexible_price_range(resolved_band) if resolved_band else (None, None, None)
-        flex_candidates: List[Dict[str, Any]] = []
-
-        if lo is not None:
-            for r in base_pool:
-                price_val = to_float_or_none(r.get("price"))
-                if price_val is None:
-                    continue
-                if hi is not None:
-                    if lo <= price_val <= hi:
-                        flex_candidates.append(r)
-                else:
-                    if price_val >= lo:
-                        flex_candidates.append(r)
-
-        # Combine strict + flex (unique by id/name)
-        seen_ids = set()
-        combined: List[Dict[str, Any]] = []
-
-        def add_unique(rows: List[Dict[str, Any]]) -> None:
-            for row in rows:
-                key = row.get("id") or row.get("name")
-                if not key:
-                    continue
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
-                combined.append(row)
-
-        add_unique(strict_candidates)
-        add_unique(flex_candidates)
-
-        # If still not enough, just fill from base_pool by proximity to target_mid
-        if len(combined) < min_needed and target_mid is not None:
-            remaining: List[Dict[str, Any]] = []
-            for r in base_pool:
-                key = r.get("id") or r.get("name")
-                if not key or key in seen_ids:
-                    continue
-                price_val = to_float_or_none(r.get("price"))
-                if price_val is None:
-                    continue
-                remaining.append(r)
-
-            remaining.sort(
-                key=lambda r: abs(
-                    (to_float_or_none(r.get("price")) or target_mid) - target_mid
-                )
-            )
-            for r in remaining:
-                key = r.get("id") or r.get("name")
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
-                combined.append(r)
-                if len(combined) >= min_needed:
+        # closest fill by distance (only if needed)
+        if len(staged) < max_candidates:
+            tgt = price_target(band)
+            leftovers.sort(key=lambda x: abs((x.get("price") or tgt) - tgt))
+            for f in leftovers:
+                staged.append((f, "closest"))
+                if len(staged) >= max_candidates:
                     break
 
-        filtered = combined
-        price_flex_used = True
+        # finally add no_price
+        if len(staged) < max_candidates:
+            for f in no_price:
+                staged.append((f, "noprice"))
+                if len(staged) >= max_candidates:
+                    break
 
-    # Truncate to max_candidates
-    if len(filtered) > max_candidates:
-        filtered = filtered[:max_candidates]
+    else:
+        staged = [(f, "strict" if f.get("price") is not None else "noprice") for f in pool]
 
-    print(
-        f"🧪 Candidate selection: {len(filtered)} perfumes after filters "
-        f"(scent={target_scent or 'any'}, price_band={resolved_band or 'any'}, "
-        f"gender={gender_filter or 'any'}, price_flex_used={price_flex_used}, "
-        f"total_catalog={len(catalog)})"
+    # Pre-score to choose best candidates for LLM
+    scored = []
+    for f, tier in staged:
+        sc = pre_score_candidate(
+            feat=f,
+            selected_setting=selected_setting,
+            band=band,
+            tier=tier,
+            profile_sig=profile_sig,
+        )
+        scored.append((sc, f, tier))
+
+    # Sort + small shuffle within top bands to avoid “same 3 forever”
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[: max_candidates]
+
+    # Mild exploration: shuffle last 20% of the candidate set
+    if len(top) > 20:
+        head = top[: int(len(top) * 0.8)]
+        tail = top[int(len(top) * 0.8):]
+        random.shuffle(tail)
+        top = head + tail
+
+    candidates = []
+    for _, f, tier in top:
+        f2 = dict(f)
+        f2["_price_tier"] = tier
+        candidates.append(f2)
+
+    return candidates
+
+
+# ---------- LLM prompt ----------
+def build_system_prompt() -> str:
+    return (
+        "You are ScentFeed, a professional perfume recommender with TikTok/Meta ranking discipline.\n"
+        "You MUST choose only from the provided CANDIDATE LIST by integer candidate_index.\n"
+        "You are given:\n"
+        " - GOAL (human text)\n"
+        " - Selected scent / setting / price_band / gender\n"
+        " - PROFILE lists (likes/dislikes/owned/wishlist)\n"
+        " - Taste DNA (derived from liked/disliked perfumes: liked_notes/tags, disliked_notes/tags)\n"
+        " - Candidates contain: tags, notes, price, and 3 scores: hype_score / mass_appeal_score / versatility_score (0-100)\n"
+        "\n"
+        "Ranking rules:\n"
+        " - Scent match is HARD (already filtered). Do not violate it.\n"
+        " - Prefer strict price matches; relaxed/closest only if needed.\n"
+        " - Use setting intent:\n"
+        "   • Night Out: hype matters most\n"
+        "   • Date Night: mass appeal matters most\n"
+        "   • Work/Everyday/Travel: versatility matters most\n"
+        " - Avoid DISLIKED notes/tags and DISLIKED perfumes.\n"
+        " - Avoid recommending OWNED unless insufficient options.\n"
+        " - If wishlist overlaps, it’s a positive signal.\n"
+        " - Provide 1-2 sentence reason.\n"
+        "\n"
+        "Output JSON ONLY (minified), schema:\n"
+        "{\n"
+        "  \"items\": [\n"
+        "    {\"candidate_index\": 0, \"reason\": \"...\", \"match_score\": 0-100, \"notes\": \"comma notes\" or null},\n"
+        "    ...\n"
+        "  ],\n"
+        "  \"used_profile\": {\"likes\":[],\"dislikes\":[],\"owned\":[],\"wishlist\":[]},\n"
+        "  \"request_id\": \"string\"\n"
+        "}\n"
     )
 
-    return filtered
+
+def summarize_candidate(idx: int, f: Dict[str, Any]) -> str:
+    name = f["name"]
+    brand = f.get("brand") or "Unknown"
+    price = f.get("price")
+    tier = f.get("_price_tier") or "strict"
+    scent_tags = ", ".join(f.get("scent_tags") or [])
+    setting_tags = ", ".join(f.get("setting_tags") or [])
+    notes = ", ".join(f.get("notes") or [])
+    hype = f.get("hype_score")
+    mass = f.get("mass_appeal_score")
+    vers = f.get("versatility_score")
+    return (
+        f"[{idx}] {name} by {brand} | price: {price} | price_tier: {tier} | "
+        f"hype_score: {hype}, mass_appeal_score: {mass}, versatility_score: {vers} | "
+        f"scent_tags: {scent_tags} | setting_tags: {setting_tags} | notes: {notes}"
+    )
+
+
+def build_user_prompt(u: Dict[str, Any], profile_sig: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+    lines = [summarize_candidate(i, c) for i, c in enumerate(candidates)]
+    return "\n\n".join([
+        f"GOAL: {u['goal']}",
+        f"SELECTED:\n  scent: {u['selected_scent']}\n  setting: {u['selected_setting']}\n  price_band: {u['price_band']}\n  gender: {u['gender']}",
+        "PROFILE:\n"
+        f"  likes: {u['profile']['likes']}\n"
+        f"  dislikes: {u['profile']['dislikes']}\n"
+        f"  owned: {u['profile']['owned']}\n"
+        f"  wishlist: {u['profile']['wishlist']}",
+        "TASTE_DNA:\n"
+        f"  liked_tags: {profile_sig.get('liked_tags') or []}\n"
+        f"  disliked_tags: {profile_sig.get('disliked_tags') or []}\n"
+        f"  liked_notes: {profile_sig.get('liked_notes') or []}\n"
+        f"  disliked_notes: {profile_sig.get('disliked_notes') or []}",
+        f"MAX_RESULTS: {u['max_results']}",
+        "CANDIDATE LIST (choose ONLY by candidate_index):\n" + "\n".join(lines),
+    ])
 
 
 # ---------- Routes ----------
-
-
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    catalog = load_catalog_from_supabase()
-    status = "healthy-with-catalog" if catalog else "healthy-no-catalog"
-    return HealthResponse(
-        ok=True,
-        status=status,
-        version=BACKEND_VERSION,
-        model="gpt-4o-mini",
-    )
+    try:
+        catalog = load_catalog_from_supabase()
+        status = f"healthy-with-catalog:{len(catalog)}"
+    except Exception as e:
+        status = f"healthy-no-catalog:{repr(e)}"
+    return HealthResponse(ok=True, status=status, version=BACKEND_VERSION, model="gpt-4o-mini")
 
 
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest) -> RecommendResponse:
-    """
-    Main recommendation endpoint called by the iOS app.
-    - Loads Supabase catalog
-    - Filters candidates by scent + price_band (with 20% flex if needed)
-    - Asks OpenAI to RANK by candidate_index
-    - Maps back to real perfumes and returns top N (up to 3)
-    """
-    goal = trimmed_or_none(req.goal)
-    if not goal:
+    # 0) Validate
+    if not req.goal or not req.goal.strip():
         raise HTTPException(status_code=400, detail="Goal must not be empty.")
 
-    max_results = max(1, min(req.max_results, 3))  # app wants 3, but clamp for safety
+    # 1) Unify request shape
+    u = unify_request(req)
+    max_results = u["max_results"]
 
-    # 1) Load catalog
-    catalog_all = load_catalog_from_supabase()
+    # 2) Load Supabase catalog (ONLINE ONLY)
+    try:
+        raw_rows = load_catalog_from_supabase()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
 
-    if not catalog_all:
-        # No catalog → let the app use offline CSV fallback instead of random hardcoded items
-        print("⚠️ Catalog empty or Supabase not configured — returning 503 to trigger offline fallback.")
-        raise HTTPException(status_code=503, detail="Catalog unavailable.")
+    if not raw_rows:
+        raise HTTPException(status_code=503, detail="Supabase catalog empty.")
 
-    # 2) Build candidate list for this request
-    candidates = filter_candidates_for_request(catalog_all, req, max_candidates=60)
+    # 3) Normalize features
+    feats = [row_to_features(r) for r in raw_rows]
+    feats = [f for f in feats if f.get("name")]
 
-    # If somehow still no candidates (tiny DB), return 503 so iOS uses offline CSV
+    # 4) Build taste DNA
+    profile_sig = build_profile_signature(feats, u["profile"])
+
+    # 5) Retrieve candidates (filtered + pre-ranked)
+    candidates = retrieve_candidates(
+        feats=feats,
+        selected_scent=u["selected_scent"],
+        selected_setting=u["selected_setting"],
+        band=u["price_band"],
+        gender=u["gender"],
+        max_results=max_results,
+        profile_sig={
+            **profile_sig,
+            "disliked_names": [norm(x) for x in u["profile"]["dislikes"] if norm(x)],
+        },
+        max_candidates=80,
+    )
+
     if not candidates:
-        print("⚠️ No candidates after filtering — returning 503 to trigger offline CSV fallback.")
-        raise HTTPException(status_code=503, detail="No candidates after filtering.")
+        # No hardcoded perfumes. Signal failure; iOS should fall back to offline.
+        raise HTTPException(status_code=404, detail="No candidates matched constraints (scent/price/gender).")
 
+    # 6) LLM rerank
     system_prompt = build_system_prompt()
-    user_prompt = build_user_prompt(req, candidates)
+    user_prompt = build_user_prompt(u, profile_sig, candidates)
 
     try:
         started = time.time()
-
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.5,
-            max_tokens=900,
+            temperature=0.35,
+            max_tokens=700,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         )
-
         latency_ms = int((time.time() - started) * 1000)
-        choice = completion.choices[0]
-        raw_json = choice.message.content
+        raw_json = completion.choices[0].message.content
+        print(f"🌐 /recommend status: 200, latency={latency_ms}ms, candidates={len(candidates)}")
 
-        print(
-            f"🌐 /recommend status: 200, latency={latency_ms}ms, "
-            f"candidates={len(candidates)}, goal={goal!r}"
-        )
-
-        # Parse JSON from the model
         try:
             data = json.loads(raw_json)
         except Exception:
-            print(f"❗️/recommend decode failed. Raw body: {raw_json!r}")
-            # Decode error → let app use offline CSV instead of hardcoded perfumes
-            raise HTTPException(status_code=502, detail="LLM decode error.")
+            raise HTTPException(status_code=503, detail=f"Model JSON decode failed. body={raw_json!r}")
 
-        # used_profile from model (or default)
-        used_profile = data.get("used_profile") or {}
-        used_profile_obj = UsedProfile(
-            likes=used_profile.get("likes") or req.prefs.likes,
-            dislikes=used_profile.get("dislikes") or req.prefs.dislikes,
-            owned=used_profile.get("owned") or req.prefs.owned,
-            wishlist=used_profile.get("wishlist") or req.prefs.wishlist,
-        )
-
-        # items from model: candidate_index + reason + score + notes
         items_data = data.get("items") or []
-        cleaned_items: List[RecommendItem] = []
+        cleaned: List[RecommendItem] = []
 
-        for raw_item in items_data:
-            idx = raw_item.get("candidate_index")
+        for it in items_data:
+            idx = it.get("candidate_index")
             try:
-                idx_int = int(idx)
+                idx = int(idx)
             except Exception:
                 continue
-            if idx_int < 0 or idx_int >= len(candidates):
+            if idx < 0 or idx >= len(candidates):
                 continue
 
-            row = candidates[idx_int]
-            name = (row.get("name") or "").strip()
+            c = candidates[idx]
+            name = c.get("name")
             if not name:
                 continue
 
-            reason = raw_item.get("reason") or "No reason provided."
-            match_score = raw_item.get("match_score") or 75
-            notes = raw_item.get("notes")
+            reason = it.get("reason") or "Recommended based on your selections."
+            score = clamp_int(it.get("match_score"), 0, 100, 75)
+            notes = it.get("notes")
 
-            try:
-                score_int = int(match_score)
-            except Exception:
-                score_int = 75
-
-            cleaned_items.append(
+            cleaned.append(
                 RecommendItem(
                     name=name,
                     reason=reason,
-                    match_score=max(0, min(100, score_int)),
-                    notes=notes,
+                    match_score=score,
+                    notes=notes if isinstance(notes, str) else None,
                 )
             )
+            if len(cleaned) >= max_results:
+                break
 
-        # Keep at most max_results
-        cleaned_items = cleaned_items[:max_results]
-
-        # If the model gave us no usable items, tell the app to use offline CSV
-        if not cleaned_items:
-            print("⚠️ Model returned empty/invalid ranked items — 502 to trigger offline CSV fallback.")
-            raise HTTPException(status_code=502, detail="LLM returned no items.")
-
-        request_id = data.get("request_id") or completion.id
+        if not cleaned:
+            raise HTTPException(status_code=503, detail="Model returned no usable ranked items.")
 
         return RecommendResponse(
-            items=cleaned_items,
-            used_profile=used_profile_obj,
-            request_id=request_id,
+            items=cleaned,
+            used_profile=UsedProfile(
+                likes=u["profile"]["likes"],
+                dislikes=u["profile"]["dislikes"],
+                owned=u["profile"]["owned"],
+                wishlist=u["profile"]["wishlist"],
+            ),
+            request_id=(data.get("request_id") or completion.id),
         )
 
     except HTTPException:
-        # Already a proper error for the app to interpret
         raise
     except Exception as e:
-        print("❌ /recommend unexpected error:", repr(e))
-        # Generic error → iOS will use offline CSV fallback
-        raise HTTPException(status_code=500, detail="Internal server error.")
+        # No fake recommendations; let iOS fall back.
+        raise HTTPException(status_code=503, detail=f"Online recommend failed: {repr(e)}")
 
 
